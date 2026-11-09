@@ -1,0 +1,82 @@
+:root {
+  --bg: #1c1f26;
+  --panel: rgba(36, 40, 48, .92);
+  --border: #363c48;
+  --text: #dde2ea;
+  --muted: #959eae;
+  --accent: #7fc8a4;
+  --accent-text: #13291f;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 var(--font); }
+#map { position: fixed; inset: 0; background: var(--bg); }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+
+/* Crisp pixels when zoomed in beyond 1 block = 1 pixel */
+.leaflet-tile { image-rendering: pixelated; image-rendering: crisp-edges; }
+.leaflet-container { background: var(--bg); font: inherit; }
+.leaflet-control-zoom a { background: var(--panel) !important; color: var(--text) !important; border-color: var(--border) !important; }
+
+.panel {
+  position: fixed; z-index: 1000; padding: 8px 10px; border-radius: 10px;
+  background: var(--panel); border: 1px solid var(--border); backdrop-filter: blur(6px);
+}
+.top-left { top: 12px; left: 56px; display: flex; align-items: center; gap: 12px; }
+.top-right { top: 12px; right: 12px; min-width: 150px; max-height: 50vh; overflow: auto; }
+.bottom-left { bottom: 12px; left: 12px; font-family: var(--mono); }
+.title { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+.logo { width: 14px; height: 14px; border-radius: 3px; background: var(--accent); }
+
+.dims { display: flex; gap: 3px; }
+.dims button {
+  border: 0; border-radius: 6px; padding: 4px 9px; cursor: pointer; font: inherit; font-weight: 600;
+  background: transparent; color: var(--muted);
+}
+.dims button:hover { color: var(--text); }
+.dims button.active { background: var(--accent); color: var(--accent-text); }
+
+.mode {
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; font: inherit; font-weight: 700;
+  background: transparent; color: var(--text);
+}
+.mode:hover { border-color: var(--accent); color: var(--accent); }
+.mode:disabled { opacity: .5; cursor: wait; }
+
+/* 3D view above Leaflet (incl. its zoom buttons), below the panels */
+#map3d { position: fixed; inset: 0; z-index: 900; background: var(--bg); touch-action: none; }
+#map3d canvas { display: block; }
+.overlay3d { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.marker3d { position: absolute; left: 0; top: 0; will-change: transform; }
+
+.player { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; }
+.player:hover { color: var(--accent); }
+.player .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.player .where { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-left: auto; }
+
+/* Leaflet places the icon's top-left corner on the coordinate (iconAnchor [0, 0]); shift the
+   marker so the pin's centre sits there instead (pin is 10 px tall -> half of it below the point),
+   otherwise the offset grows to hundreds of blocks when zoomed out. */
+.marker {
+  display: flex; flex-direction: column; align-items: center; pointer-events: none;
+  width: max-content; transform: translate(-50%, calc(-100% + 5px));
+}
+.marker .name {
+  padding: 1px 6px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border);
+  white-space: nowrap; font-weight: 600; font-size: 12px;
+}
+.marker .pin { width: 10px; height: 10px; margin-top: 3px; border-radius: 50%; background: var(--accent); border: 2px solid var(--accent-text); }
+.marker.spawn .name { color: #e2bd72; }
+.marker.spawn .pin { background: #e2bd72; border-radius: 2px; }
+
+.empty {
+  position: fixed; inset: 0; display: grid; place-items: center; z-index: 999;
+  color: var(--muted); font-size: 15px; pointer-events: none;
+}
+
+@media (max-width: 600px) {
+  .top-left { left: 12px; top: auto; bottom: 52px; flex-wrap: wrap; }
+  .top-right { max-width: 45vw; }
+}

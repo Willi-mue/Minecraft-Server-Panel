@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Map</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%237fc8a4'/><path d='M3 4l3-1 4 1 3-1v9l-3 1-4-1-3 1z' fill='%2313291f'/></svg>">
+  <link rel="stylesheet" href="vendor/leaflet.css">
+  <link rel="stylesheet" href="map.css">
+  <script type="importmap">
+    { "imports": {
+      "three": "./vendor/three.module.min.js",
+      "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js",
+      "three/addons/controls/MapControls.js": "./vendor/MapControls.js"
+    } }
+  </script>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="map3d" class="hidden"></div>
+
+  <div class="panel top-left">
+    <div class="title"><span class="logo"></span> Live Map</div>
+    <div id="dims" class="dims"></div>
+    <button id="mode" class="mode" title="3D view (left drag: move, right drag: rotate)">3D</button>
+  </div>
+
+  <div class="panel bottom-left" id="coords">x –, z –</div>
+  <div class="panel top-right" id="players-box"><div class="muted">No players online</div></div>
+  <div id="empty" class="empty hidden">The map has not been rendered yet.</div>
+
+  <script src="vendor/leaflet.js"></script>
+  <script src="map.js"></script>
+</body>
+</html>

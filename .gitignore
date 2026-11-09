@@ -1,26 +1,40 @@
-banned-players.json
-banned-ips.json
-bukkit.yml
-commands.yml
-help.yml
-permissions.yml
-ops.json
-spigot.yml
-usercache.json
-version_history.json
-cache
-config
-libraries
-logs
-plugins
-versions
-world_the_end
-world_nether
-world
-whitelist.json
-backups
-.temp
-__pycache__
-server.properties
-eula.txt
+# --- Runtime data ---
+# Server files, worlds, downloaded jars, backups and settings.json (DATA_DIR)
+/data/
+
+# Server jars anywhere in the repo
 *.jar
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- IDEs / editors ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Claude Code (local, personal settings only) ---
+.claude/settings.local.json
+
+# --- Rust build output ---
+/mapgen/target/

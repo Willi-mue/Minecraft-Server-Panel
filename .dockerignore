@@ -1,0 +1,15 @@
+.git
+.claude
+.env
+.env.*
+data
+screenshots
+__pycache__
+*.pyc
+.venv
+venv
+*.md
+tests
+requirements-dev.txt
+.pytest_cache
+mapgen/target
