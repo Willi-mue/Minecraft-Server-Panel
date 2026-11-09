@@ -111,7 +111,7 @@ $("#logout").addEventListener("click", async () => {
 // ---------- console & chat ----------
 
 function lineClass(line) {
-  if (line.startsWith("[GUI]")) return "gui";
+  if (line.startsWith("[Panel]")) return "gui";
   if (/(\/| )(ERROR|FATAL)\]|Exception/.test(line)) return "err";
   if (/(\/| )WARN\]/.test(line)) return "warn";
   if (/\]: (\[Not Secure\] )?<\w+>/.test(line)) return "chat";

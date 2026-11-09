@@ -19,9 +19,9 @@ from . import access, backup, config, datapacks, java, livemap, properties, vers
 from .mapserver import MapServer
 from .server import BusyError, manager
 
-log = logging.getLogger("mcgui")
+log = logging.getLogger("panel")
 STATIC_DIR = Path(__file__).parent / "static"
-COOKIE = "mcgui_session"
+COOKIE = "panel_session"
 
 _password = config.PASSWORD
 _sessions: dict[str, float] = {}
@@ -160,7 +160,7 @@ async def _backup_schedule() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not _password:
-        raise RuntimeError("MCGUI_PASSWORD is not set. Refusing to start without a panel password.")
+        raise RuntimeError("PANEL_PASSWORD is not set. Refusing to start without a panel password.")
     config.ensure_dirs()
     manager.bind_loop(asyncio.get_running_loop())
     # Pick up Mojang jars Paper downloaded in earlier runs (needs network, so in background)
@@ -184,7 +184,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(manager.shutdown)
 
 
-app = FastAPI(title="Minecraft Server GUI", lifespan=lifespan)
+app = FastAPI(title="Minecraft Server Panel", lifespan=lifespan)
 
 
 # ---------- models ----------

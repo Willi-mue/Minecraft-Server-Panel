@@ -98,8 +98,8 @@ class ServerManager:
             pass  # event loop already closed (app shutting down)
 
     def info(self, text: str) -> None:
-        """Message from the GUI itself (not from the Minecraft process)."""
-        line = f"[GUI] {text}"
+        """Message from the panel itself (not from the Minecraft process)."""
+        line = f"[Panel] {text}"
         self.log.append(line)
         self._emit({"type": "log", "line": line})
 
@@ -481,7 +481,7 @@ class ServerManager:
 
     def accept_eula(self) -> None:
         (config.SERVER_DIR / "eula.txt").write_text(
-            "# Accepted via Minecraft Server GUI (https://aka.ms/MinecraftEULA)\neula=true\n"
+            "# Accepted via Minecraft Server Panel (https://aka.ms/MinecraftEULA)\neula=true\n"
         )
         self.eula_missing = False
         self._emit({"type": "status", "status": self.status()})

@@ -5,9 +5,9 @@ services:
       args:
         # Extra Java runtimes besides 25; add 17 / 8 only if you play old versions
         EXTRA_JAVA: ${EXTRA_JAVA:-21}
-    image: minecraft-server-gui
+    image: minecraft-server-panel
     pull_policy: build   # always build locally, never try to pull this image from a registry
-    container_name: minecraft-server-gui
+    container_name: minecraft-server-panel
     restart: unless-stopped
     env_file:
       - path: .env

@@ -1,4 +1,4 @@
-# Minecraft Server Web GUI
+# Minecraft Server Panel
 #
 # Java 25 comes with the base image (Minecraft 26.x). Further runtimes are only added if
 # listed in EXTRA_JAVA, to keep the image small:

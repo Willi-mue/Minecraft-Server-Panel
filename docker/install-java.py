@@ -16,7 +16,7 @@ import urllib.request
 ARCH = {"x86_64": "x64", "aarch64": "aarch64"}[platform.machine()]
 API = "https://api.adoptium.net/v3/assets/latest/{v}/hotspot?architecture={arch}&image_type=jre&os=linux&vendor=eclipse"
 # The Adoptium API rejects Python's default User-Agent
-HEADERS = {"User-Agent": "minecraft-server-gui-build/1.0"}
+HEADERS = {"User-Agent": "minecraft-server-panel-build/1.0"}
 
 
 def _open(url: str):

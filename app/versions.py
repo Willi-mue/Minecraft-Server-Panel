@@ -16,7 +16,7 @@ from . import config
 MOJANG_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 # PaperMC asks API clients to identify themselves with a descriptive User-Agent
-USER_AGENT = "minecraft-server-gui/1.0 (self-hosted server panel)"
+USER_AGENT = "minecraft-server-panel/1.0 (self-hosted server panel)"
 FLAVORS = ("vanilla", "paper")
 _CACHE_TTL = 600
 

@@ -14,7 +14,7 @@ All code lives in `app/` (the old PyQt5 desktop version has been removed).
 
 ```bash
 pip install -r requirements.txt
-MCGUI_PASSWORD=secret python -m app       # PowerShell: $env:MCGUI_PASSWORD="secret"; python -m app
+PANEL_PASSWORD=secret python -m app       # PowerShell: $env:PANEL_PASSWORD="secret"; python -m app
 # -> http://localhost:47318, data in ./data (override with DATA_DIR)
 
 cp .env.example .env && docker compose up -d --build   # Docker; EXTRA_JAVA build arg adds Java runtimes
@@ -36,7 +36,7 @@ Tests: `pip install -r requirements-dev.txt && pytest`; single test:
 `pytest tests/test_server_parsing.py -k <name>`, Rust: `cd mapgen && cargo test <name>` (pure functions + file handling, no
 Minecraft/Java/network; the `data` fixture in `tests/conftest.py` redirects all data paths to a temp
 dir). Starlette's `TestClient` needs an extra package, so API behaviour is not unit-tested. No linter
-config or frontend build. The app refuses to start without `MCGUI_PASSWORD`. Running locally needs `java` on `PATH` (or runtimes under `JAVA_DIR/<major>/bin/`).
+config or frontend build. The app refuses to start without `PANEL_PASSWORD` (old name `MCGUI_PASSWORD` is still read as a fallback). Running locally needs `java` on `PATH` (or runtimes under `JAVA_DIR/<major>/bin/`).
 Static files are served with content-hash query strings, so frontend edits show up on reload
 without restarting; Python changes need a restart (no `--reload` is configured).
 
@@ -154,7 +154,7 @@ game settings dialog), `world.py` (minimal NBT reader: `level.dat` → `Data.Ver
 - User-supplied flavor/version ids are validated (`validate_flavor`, `config.validate_version`)
   before being used in file paths — keep that for any new path built from request data.
 - Console commands are rejected if they contain newlines (stdin injection).
-- Sessions are in-memory (lost on restart), cookie `mcgui_session`, httponly + samesite=strict.
+- Sessions are in-memory (lost on restart), cookie `panel_session`, httponly + samesite=strict.
 
 ## Docker notes
 

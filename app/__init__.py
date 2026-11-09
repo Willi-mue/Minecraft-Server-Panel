@@ -1,1 +1,1 @@
-"""Minecraft Server Web GUI."""
+"""Minecraft Server Panel."""

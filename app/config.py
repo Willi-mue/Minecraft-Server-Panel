@@ -21,7 +21,8 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_PORT", "47318"))
-PASSWORD = os.environ.get("MCGUI_PASSWORD", "")
+# MCGUI_PASSWORD = old name, still read so existing .env files keep working
+PASSWORD = os.environ.get("PANEL_PASSWORD") or os.environ.get("MCGUI_PASSWORD", "")
 
 # Live map: port the public map server listens on, and the port players use to reach it
 # (differs in Docker, where compose maps MAP_PORT_HOST -> MAP_PORT)

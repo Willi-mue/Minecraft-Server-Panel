@@ -1,15 +1,45 @@
-# Minecraft Server Panel [Vanilla & Paper]
+<h1 align="center">Minecraft Server Panel</h1>
+
+<p align="center">
+  <b>Run, manage and share a Minecraft Java server from your browser. Paper or Vanilla, any version.</b><br>
+  One-screen web panel · live 2D/3D map · live backups · Docker or plain Python
+</p>
+
+<p align="center">
+  <a href="#quick-start-with-docker">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#development">Development</a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="screenshots/panel-light.png">
+  <img alt="The panel with a running Paper server: console, controls, players, resources, server and backups" src="screenshots/panel-dark.png">
+</picture>
 
 A lightweight web interface for running a Minecraft Java Edition server, either **Paper**
 (performance-optimized, default) or **Vanilla** (Mojang). Start, stop, restart and back up the server,
 follow the console and chat live, manage players, pick any version and share a live map, all from the
 browser on a single screen. It runs as a Docker container or directly with Python.
 
-![Minecraft Server Panel](screenshots/picture1.png)
+## Live map in 2D and 3D
+
+Every server type gets a live map on its own port that you can share with your players. Nothing runs
+inside Minecraft: a small Rust renderer reads the world files and draws them with the real block
+textures, so you can fly over your world block by block.
+
+<p align="center">
+  <img alt="Orbiting the live map in 3D" src="screenshots/map-3d.gif" width="100%">
+</p>
+
+| 2D overview | 3D view |
+|---|---|
+| ![2D live map with spawn marker](screenshots/map-2d.png) | ![3D live map of a badlands mesa](screenshots/map-3d.png) |
 
 ## Features
 
-- 🌐 Web panel with password login, fits on one screen (scrolls on phones), light and dark theme
+### Server
+
 - 🟢 Start / stop / restart, with an optional in-game countdown for players (cancellable)
 - 🧩 **Paper or Vanilla, any version**: searchable version list from the PaperMC API or Mojang's
   manifest, including snapshots/pre-releases if wanted. Jars are checksum-verified (SHA256/SHA1)
@@ -17,36 +47,48 @@ browser on a single screen. It runs as a Docker container or directly with Pytho
 - ⚠️ **Version change safety**: upgrading shows a hint, while **downgrading below the version your
   world was last saved with shows a warning** and asks for confirmation (also for imported worlds,
   read from `level.dat`). A missing Java runtime is flagged too
-- 🗑️ Manage downloaded server jars (build, size, Java version; update Paper to its newest build; delete old
-  ones). The Mojang jar Paper
-  downloads on first start is verified and offered as a Vanilla server too (hard link, no extra space)
-- 🗺️ **Live map for every server type** (Vanilla, Paper, …) on its own port, to share with players.
-  Rendered by `mapgen`, a small Rust program (< 1 MB) that reads the world files directly: real
-  Minecraft block textures and biome colours (2D and 3D), incremental (only changed regions, an unchanged world takes milliseconds), low priority,
-  limited threads. Overworld, Nether and End, zoom levels, a 3D view in blocks, world border, shareable links, live player positions
-  (polled only while someone has the map open). Reachable even while the server is stopped
+- 🗑️ Manage downloaded server jars (build, size, Java version; update Paper to its newest build; delete
+  old ones). The Mojang jar Paper downloads on first start is verified and offered as a Vanilla
+  server too (hard link, no extra space)
+- ☕ The matching Java runtime is selected per version (Docker image: Java 25 + 21 by default, 17/8 optional)
+
+### Panel
+
+- 🌐 Password login, fits on one screen (scrolls on phones), light and dark theme
+- 📜 Live console with command input and history (`↑`/`↓`), separate chat view and "say" box
+- 👥 Player list with **Whitelist** and **OP** tabs: add/remove players, kick, turn the whitelist on/off,
+  and one-click add for players the whitelist just turned away
+- ⚙️ **Game settings** dialog for `server.properties`: MOTD, difficulty, game mode, max players,
+  view/simulation distance (the biggest performance levers), spawn protection, flight, hardcore
+- 📊 CPU and RAM of just the Minecraft server and the panel (plus container network in Docker)
+- 🪶 Lightweight: the panel needs about 55 MB RAM and does nothing while no browser is connected
+
+### Live map
+
+- 🗺️ **Works with every server type** (Vanilla, Paper, …) on its own port, to share with players.
+  Reachable even while the server is stopped
+- 🧱 Real Minecraft block textures and biome colours, in 2D and in a 3D view built from actual blocks
+- 🌍 Overworld, Nether and End, zoom levels, world border, shareable links, live player positions
+  (polled only while someone has the map open)
+- 🦀 Rendered by `mapgen`, a small Rust program (< 1 MB) that reads the world files directly:
+  incremental (only changed regions, an unchanged world takes milliseconds), low priority, limited threads
+
+### Worlds and backups
+
+- 💾 Live backups without stopping the server, optional schedule, retention, download, and
+  **one-click restore** (the current world is backed up first)
+- 🌱 **New world** button: archives the current world (`archive_*.zip`, never deleted automatically),
+  optional seed, resets the live map
 - 📦 **Data packs**: uploaded `.zip` packs are kept in a library (`data/datapacks/`) and copied into
   the world. Switch them on/off per world (via `/datapack` while running, no restart; `level.dat` is
   edited while stopped), update the world copy, and pick which packs a **new world** starts with
   (in place before generation, so world-gen packs work), optionally with Minecraft's
   experimental feature packs (like "Experiments" in singleplayer)
-- ⚙️ **Game settings** dialog for `server.properties`: MOTD, difficulty, game mode, max players,
-  view/simulation distance (the biggest performance levers), spawn protection, flight, hardcore
-- 👥 Player list with **Whitelist** and **OP** tabs: add/remove players, kick, turn the whitelist on/off,
-  and one-click add for players the whitelist just turned away
-- 💾 Live backups without stopping the server, optional schedule, retention, download, and
-  **one-click restore** (the current world is backed up first)
-- 🌱 **New world** button: archives the current world (`archive_*.zip`, never deleted automatically),
-  optional seed, resets the live map
-- 📜 Live console with command input and history (`↑`/`↓`), separate chat view and "say" box
-- 📊 CPU and RAM of just the Minecraft server and the panel (plus container network in Docker)
-- ☕ The matching Java runtime is selected per version (Docker image: Java 25 + 21 by default, 17/8 optional)
-- 🪶 Lightweight: the panel needs about 55 MB RAM and does nothing while no browser is connected
 
 ## Quick start with Docker
 
 ```bash
-cp .env.example .env        # set MCGUI_PASSWORD (required) and TZ
+cp .env.example .env        # set PANEL_PASSWORD (required) and TZ
 docker compose up -d --build
 ```
 
@@ -80,7 +122,7 @@ Requires Python 3.10+ and Java on your `PATH` (Java 21 for 1.20.5–1.21.x, Java
 
 ```bash
 pip install -r requirements.txt
-MCGUI_PASSWORD=secret python -m app      # PowerShell: $env:MCGUI_PASSWORD="secret"; python -m app
+PANEL_PASSWORD=secret python -m app      # PowerShell: $env:PANEL_PASSWORD="secret"; python -m app
 ```
 
 The panel runs on <http://localhost:47318>, the live map on <http://localhost:47319>, and data goes to `./data`.
@@ -91,7 +133,7 @@ Environment variables (see `.env.example`):
 
 | Variable          | Default | Meaning |
 |-------------------|---------|---------|
-| `MCGUI_PASSWORD`  | **required** | Panel password. The app refuses to start without it |
+| `PANEL_PASSWORD`  | **required** | Panel password. The app refuses to start without it (the old name `MCGUI_PASSWORD` still works) |
 | `TZ`              | `UTC`   | Time zone for logs and backup names, e.g. `Europe/Berlin` |
 | `MC_FLAVOR`       | `paper` | Initial server type: `paper` or `vanilla` (can be changed in the panel) |
 | `MC_VERSION`      | –       | Initial Minecraft version (can be changed in the panel) |
@@ -139,7 +181,7 @@ renderer at `mapgen/target/release/mapgen`, on `PATH`, or via `MAPGEN_BIN`.
 
 ## Security notes
 
-- The panel gives full console access (including `op`). Always set a strong `MCGUI_PASSWORD`.
+- The panel gives full console access (including `op`). Always set a strong `PANEL_PASSWORD`.
 - If you expose it to the internet, put it behind a reverse proxy with HTTPS (Caddy, Traefik, nginx).
   Otherwise the password travels in plain text.
 - The map port only serves the rendered map files, nothing else.
@@ -147,8 +189,3 @@ renderer at `mapgen/target/release/mapgen`, on `PATH`, or via `MAPGEN_BIN`.
 ## Credits
 
 Icons: [Phosphor Icons](https://phosphoricons.com) (MIT License). Map viewer: [Leaflet](https://leafletjs.com) (BSD-2-Clause), [three.js](https://threejs.org) (MIT). Block textures are not part of this project: the panel downloads the Minecraft client from Mojang to your own server and the map reads them from there (without it, colours follow Minecraft's map items).
-
-## Planned
-
-- Panel: [TODO_DASHBOARD.md](TODO_DASHBOARD.md), [DEV_TODO_DASHBOARD.md](DEV_TODO_DASHBOARD.md)
-- Live map: [TODO_LIVEMAP.md](TODO_LIVEMAP.md), [DEV_TODO_LIVEMAP.md](DEV_TODO_LIVEMAP.md)
