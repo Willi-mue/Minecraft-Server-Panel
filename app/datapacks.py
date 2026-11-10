@@ -1,7 +1,7 @@
 """Data packs (Vanilla and Paper): a library outside the world plus installed copies in the world.
 
 - Library: `<DATA_DIR>/datapacks/` keeps every uploaded pack, independent of the world (survives
-  "New world" and restores).
+  "New world" and restores) and shared by all servers of the panel.
 - World: `<world>/datapacks/` holds copies of the installed packs; this is what Minecraft loads.
 - Enabled/disabled is per world and lives in level.dat (`Data.DataPacks.Enabled/Disabled`, ids like
   `file/<name>`). A pack in the world folder that is in neither list is new and gets enabled on the
@@ -16,7 +16,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
-from . import backup, config, nbt, world
+from . import backup, config, nbt, world  # functions with `inst` take an instances.Instance
 
 MAX_UPLOAD = 100 * 1024 * 1024
 # No quotes or backslashes (the name goes into a quoted console command), no path separators
@@ -27,9 +27,9 @@ def library() -> Path:
     return config.DATA_DIR / "datapacks"
 
 
-def folder() -> Path:
+def folder(inst) -> Path:
     """The world's datapacks folder."""
-    return config.SERVER_DIR / backup.level_name() / "datapacks"
+    return inst.server_dir / backup.level_name(inst) / "datapacks"
 
 
 def pack_id(name: str) -> str:
@@ -49,9 +49,9 @@ def _existing(base: Path, name: str, where: str) -> Path:
     return path
 
 
-def path_of(name: str) -> Path:
+def path_of(inst, name: str) -> Path:
     """Installed copy in the world."""
-    return _existing(folder(), name, "world")
+    return _existing(folder(inst), name, "world")
 
 
 def library_path(name: str) -> Path:
@@ -124,9 +124,9 @@ def _lists(root: dict) -> tuple[list, list]:
     return result[0], result[1]
 
 
-def state() -> tuple[set[str], set[str]] | None:
+def state(inst) -> tuple[set[str], set[str]] | None:
     """(enabled ids, disabled ids) from level.dat, None if the world doesn't exist yet."""
-    path = world.level_dat()
+    path = world.level_dat(inst)
     if not path.exists():
         return None
     _, root = nbt.load(path)
@@ -136,45 +136,29 @@ def state() -> tuple[set[str], set[str]] | None:
 
 # Built-in packs that are always on (not experiments)
 _BASE_PACKS = {"vanilla", "paper"}
-# Offered when there is no world to read the version's experiments from
-DEFAULT_EXPERIMENTS = ["trade_rebalance", "minecart_improvements", "redstone_experiments"]
-_EXPERIMENT_RE = re.compile(r"^[a-z0-9_.\-]{1,64}$")
-
-
-def validate_experiment(pack: str) -> str:
-    if not _EXPERIMENT_RE.match(pack) or pack in _BASE_PACKS:
-        raise ValueError(f"Invalid experimental pack: {pack}")
-    return pack
 
 
 def experiments(st: tuple[set[str], set[str]] | None) -> dict:
-    """Built-in feature packs: which the current world has on, and which can be offered for a new one."""
+    """Built-in feature packs (experiments) the current world has on; shown as a note only."""
     if st is None:
-        return {"enabled": [], "available": DEFAULT_EXPERIMENTS}
-    builtin = lambda ids: sorted(i for i in ids if not i.startswith("file/") and i not in _BASE_PACKS)  # noqa: E731
-    enabled = builtin(st[0])
-    return {"enabled": enabled, "available": sorted(set(enabled) | set(builtin(st[1]))) or DEFAULT_EXPERIMENTS}
+        return {"enabled": []}
+    return {"enabled": sorted(i for i in st[0] if not i.startswith("file/") and i not in _BASE_PACKS)}
 
 
-def initial_packs_value(chosen: list[str]) -> str:
-    """`initial-enabled-packs` for server.properties (only read when a world is created)."""
-    return ",".join(["vanilla", *dict.fromkeys(validate_experiment(p) for p in chosen)])
-
-
-def list_packs() -> dict:
+def list_packs(inst) -> dict:
     """Library and world packs merged. `status`: enabled / disabled / new (installed, enabled on next
     start) / None (not installed in this world)."""
     try:
-        st = state()
+        st = state(inst)
     except (OSError, ValueError, EOFError):
         st = None
-    lib, inst = _entries(library()), _entries(folder())
+    lib, in_world = _entries(library()), _entries(folder(inst))
     packs = []
-    for name in sorted(lib.keys() | inst.keys(), key=str.lower):
-        src = lib.get(name) or inst[name]
+    for name in sorted(lib.keys() | in_world.keys(), key=str.lower):
+        src = lib.get(name) or in_world[name]
         meta = _mcmeta(src)
         pid = pack_id(name)
-        if name not in inst:
+        if name not in in_world:
             status = None
         elif st is None or (pid not in st[0] and pid not in st[1]):
             status = "new"
@@ -184,10 +168,10 @@ def list_packs() -> dict:
         packs.append({
             "name": name,
             "in_library": name in lib,
-            "installed": name in inst,
+            "installed": name in in_world,
             "status": status,
             # Library has a different version than the world: offer to update the world copy
-            "outdated": name in lib and name in inst and _digest(lib[name]) != _digest(inst[name]),
+            "outdated": name in lib and name in in_world and _digest(lib[name]) != _digest(in_world[name]),
             "valid": meta is not None,
             "description": _text(info.get("description", "") if isinstance(info, dict) else "")[:300],
             "size_kb": round(_size(src) / 1024),
@@ -248,9 +232,9 @@ def _remove(path: Path) -> None:
         path.unlink()
 
 
-def adopt(name: str) -> None:
+def adopt(inst, name: str) -> None:
     """Copy a pack that only exists in the world (e.g. from a restored backup) into the library."""
-    _copy(path_of(name), library() / name)
+    _copy(path_of(inst, name), library() / name)
 
 
 def delete_from_library(name: str) -> None:
@@ -260,35 +244,35 @@ def delete_from_library(name: str) -> None:
 # ---------- world ----------
 
 
-def install(name: str) -> None:
+def install(inst, name: str) -> None:
     """Copy the library version into the world (also updates an older installed copy)."""
-    _copy(library_path(name), folder() / name)
+    _copy(library_path(name), folder(inst) / name)
 
 
-def uninstall(name: str) -> None:
-    _remove(path_of(name))
+def uninstall(inst, name: str) -> None:
+    _remove(path_of(inst, name))
 
 
-def prepare_new_world(names: list[str]) -> list[str]:
+def prepare_new_world(inst, names: list[str]) -> list[str]:
     """Before the old world is removed: copy packs that only exist in the world into the library, so
     the selected ones can be installed into the new world. Returns the names that are available."""
-    lib, inst = _entries(library()), _entries(folder())
+    lib, in_world = _entries(library()), _entries(folder(inst))
     for name in names:
-        if name not in lib and name in inst:
-            adopt(name)
+        if name not in lib and name in in_world:
+            adopt(inst, name)
     return [n for n in names if (library() / n).exists()]
 
 
-def install_many(names: list[str]) -> None:
+def install_many(inst, names: list[str]) -> None:
     for name in names:
-        install(name)
+        install(inst, name)
 
 
-def set_enabled_offline(name: str, enabled: bool) -> str:
+def set_enabled_offline(inst, name: str, enabled: bool) -> str:
     """Edit level.dat while the server is stopped. Returns a message for the log."""
-    path_of(name)
+    path_of(inst, name)
     pid = pack_id(name)
-    dat = world.level_dat()
+    dat = world.level_dat(inst)
     if not dat.exists():
         if enabled:
             return f"Data pack {name} will be enabled when the world is created."

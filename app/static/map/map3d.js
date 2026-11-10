@@ -7,10 +7,17 @@
 //
 // World units = blocks: x = block x, y = height, z = block z. Regions (512×512 blocks) are loaded
 // around the camera and split into 4×4 tiles of 128 blocks; each tile is one mesh whose detail
-// depends on its distance (far away, several blocks are merged into bigger boxes).
+// depends on its distance and on the window size (far away, several blocks are merged into bigger
+// boxes and from step 4 the whole region is one mesh; outside the view half the detail).
+// Options (setOptions): water / plants / leaves / fog can be hidden without a rebuild (own meshes),
+// a height slice {lo, hi} clips everything outside lo <= y < hi at once (clipping planes) and then
+// rebuilds the tiles with cut faces on top; while it is on, the stacks with every cave (`c/`,
+// maps.json "caves") are loaded instead of `v/`. WASD / arrow keys fly in the direction the camera
+// looks, Space / Shift up and down; the mouse wheel sets the flight speed while a fly key is held.
 
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
+import { disposeModel, playerModel } from "./player3d.js";
 
 const SIZE = 512;
 const NONE = -32768;
@@ -31,12 +38,22 @@ const TILES = SIZE / TILE;
 
 /** Block size of the boxes for a tile at distance d from the camera (1 = every block). */
 const stepFor = (d) => (d < 360 ? 1 : d < 800 ? 2 : d < 1600 ? 4 : d < 3000 ? 8 : 16);
+/** From this step on a whole region is one mesh (fewer draw calls far away). */
+const WHOLE_FROM = 4;
+
+/** BufferAttribute upload callback: drop the CPU copy. */
+function freeArray() {
+  this.array = null;
+}
 
 // The tile colors are final sRGB values: pass them (and the fog colour) through unchanged
 THREE.ColorManagement.enabled = false;
 
-export function create({ container, makeMarker, onHover, onChange }) {
+export const FLY_SPEED = { min: 2, max: 2000, default: 40 }; // blocks per second
+
+export function create({ container, makeMarker, onHover, onChange, onSpeed }) {
   const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.localClippingEnabled = true;
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setClearColor(BG);
@@ -103,7 +120,36 @@ export function create({ container, makeMarker, onHover, onChange }) {
   const waterMaterial = new THREE.MeshBasicMaterial({
     vertexColors: true, map: white, transparent: true, opacity: 0.8, depthWrite: false, side: THREE.DoubleSide,
   });
-  const materials = { opaque: material, cutout: cutoutMaterial, water: waterMaterial };
+  // Textures repeat across a quad (the worker merges equal neighbouring faces into one quad): per
+  // vertex the texture index (`tex`) and coordinates in texture widths (`uv`, 0..n); the shader
+  // picks the atlas cell and wraps with fract(). textureGrad keeps the mip level of the unwrapped
+  // coordinates, so the wrap shows no seams. Atlas layout: see atlasTexture.
+  const atlasInfo = { cols: { value: 1 }, size: { value: new THREE.Vector2(32, 32) } };
+  const repeatTextures = (shader) => {
+    shader.uniforms.atlasCols = atlasInfo.cols;
+    shader.uniforms.atlasSize = atlasInfo.size;
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute float tex;\nflat varying float vTex;\nvarying vec2 vLocal;")
+      .replace("#include <uv_vertex>", "#include <uv_vertex>\nvTex = tex;\nvLocal = uv;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nuniform float atlasCols;\nuniform vec2 atlasSize;\nflat varying float vTex;\nvarying vec2 vLocal;")
+      .replace("#include <map_fragment>", `
+        float cellIndex = floor(vTex + 0.5);
+        vec2 cell = vec2(mod(cellIndex, atlasCols), floor(cellIndex / atlasCols));
+        vec2 cellSize = 16.0 / atlasSize;
+        vec2 atlasUv = (cell * 32.0 + 8.0) / atlasSize + fract(vLocal) * cellSize;
+        diffuseColor *= textureGrad(map, atlasUv, dFdx(vLocal) * cellSize, dFdy(vLocal) * cellSize);`);
+  };
+  for (const m of [material, cutoutMaterial, waterMaterial]) m.onBeforeCompile = repeatTextures;
+  // plants and leaves are separate meshes (so they can be hidden) with the cutout material
+  const materials = { opaque: material, cutout: cutoutMaterial, water: waterMaterial, plants: cutoutMaterial, leaves: cutoutMaterial };
+  const PARTS = Object.keys(materials);
+  const options = { water: true, plants: true, leaves: true, fog: true, slice: null, caves: false, flySpeed: FLY_SPEED.default };
+  /** Which stack files to load: every cave only while the height slice is on (else hidden anyway). */
+  const voxelSet = () => (options.caves && options.slice ? "c" : "v");
+  // height slice: keep lo <= y <= hi (a hair above hi, so the cut faces at hi survive)
+  const clipTop = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);
+  const clipBottom = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   let stamp = null; // texture tables in use ("" = none)
 
   /** The atlas with its own mipmaps that stop at 1 px per 16 px texture: the GPU's automatic
@@ -164,11 +210,16 @@ export function create({ container, makeMarker, onHover, onChange }) {
     clear();
     await ask("init", { type: "init", stamp: next, base: location.href });
     let tex = white;
+    atlasInfo.cols.value = 1;
+    atlasInfo.size.value.set(32, 32); // plain white: any cell samples the 1×1 texture
     if (next) {
       try {
         const res = await fetch(`atlas.png?v=${encodeURIComponent(next)}`);
         const bitmap = await createImageBitmap(await res.blob(), { imageOrientation: "none", premultiplyAlpha: "none" });
+        const cols = bitmap.width / 16, rows = bitmap.height / 16;
         tex = atlasTexture(bitmap);
+        atlasInfo.cols.value = cols;
+        atlasInfo.size.value.set(cols * 32, rows * 32);
       } catch {
         tex = white;
       }
@@ -183,7 +234,13 @@ export function create({ container, makeMarker, onHover, onChange }) {
 
   const camera = new THREE.PerspectiveCamera(50, 1, 1, 4000);
   const controls = new MapControls(camera, renderer.domElement);
-  controls.maxPolarAngle = Math.PI / 2 - 0.05;
+  // Looking around is our own (`look` below): the camera turns about itself like a player, the
+  // orbit centre (used for pan/zoom/detail) is carried along in front of it. MapControls only pans
+  // (left drag) and zooms (wheel); its polar limits allow any view direction from straight down
+  // to almost straight up.
+  controls.enableRotate = false;
+  controls.minPolarAngle = 0.01;
+  controls.maxPolarAngle = Math.PI - 0.01;
   controls.minDistance = 8;
   controls.maxDistance = 4000;
   controls.zoomToCursor = true;
@@ -227,12 +284,14 @@ export function create({ container, makeMarker, onHover, onChange }) {
   }
   new ResizeObserver(resize).observe(container);
 
-  /** y of the top face of the block column at (x, z), null if unknown. */
+  /** y of the top face of the block column at (x, z), null if unknown (with a height slice: at
+   *  most its top, so the camera can go down into the slice). */
   function heightAt(x, z) {
     const r = regions.get(`${Math.floor(x / SIZE)},${Math.floor(z / SIZE)}`);
     if (!r || !r.heights) return null;
     const h = r.heights[(Math.floor(z) - r.z * SIZE) * SIZE + Math.floor(x) - r.x * SIZE];
-    return h === NONE ? null : h;
+    if (h === NONE) return null;
+    return options.slice ? Math.min(h, options.slice.hi) : h;
   }
 
   // ----- loading -----
@@ -248,28 +307,34 @@ export function create({ container, makeMarker, onHover, onChange }) {
   async function load(r) {
     r.state = "loading";
     loading++;
-    const d = dim, textured = !!stamp;
+    const d = dim, textured = !!stamp, set = voxelSet();
+    if (r.voxelSet !== set) r.etagV = null; // other stack files: fetch them even if unchanged
     try {
       const [h, c, v] = await Promise.all([
         fetchTagged(`tiles/${d}/h/${r.x}_${r.z}.png`, r.etagH),
         fetchTagged(`tiles/${d}/${textured ? "b" : "0"}/${r.x}_${r.z}.png`, r.etagC),
         // block stacks (real blocks in 3D); missing for maps rendered without textures
-        textured ? fetchTagged(`tiles/${d}/v/${r.x}_${r.z}.bin`, r.etagV).catch(() => ({ same: true })) : { same: true },
+        textured ? fetchTagged(`tiles/${d}/${set}/${r.x}_${r.z}.bin`, r.etagV).catch(() => ({ same: true })) : { same: true },
       ]);
+      r.voxelSet = set;
       if (d !== dim || regions.get(`${r.x},${r.z}`) !== r) return; // dimension changed meanwhile
       if (h.same && c.same && v.same) {
         r.state = r.heights ? "ready" : "empty";
         return;
       }
+      // one worker decodes, the others adopt its result (no decoding the same files three times)
       const msg = { type: "load", key: r.key, heights: h.buffer, [textured ? "blocks" : "color"]: c.buffer, voxels: v.buffer };
-      const res = await ask(`loaded:${r.key}`, msg, [h.buffer, c.buffer, v.buffer].filter(Boolean));
+      const w = workers.reduce((a, b) => (b.busy < a.busy ? b : a));
+      w.busy++;
+      const res = await askOne(w, `loaded:${r.key}`, msg, [h.buffer, c.buffer, v.buffer].filter(Boolean)).finally(() => w.busy--);
+      for (const o of workers) if (o !== w) o.postMessage({ type: "adopt", key: r.key, entry: res.entry });
       if (d !== dim || regions.get(`${r.x},${r.z}`) !== r) return;
       r.etagH = h.tag || r.etagH;
       r.etagC = c.tag || r.etagC;
       r.etagV = v.tag || r.etagV;
       r.heights = res.heights;
       r.state = res.ok ? "ready" : "empty";
-      for (const t of r.tiles) {
+      for (const t of meshesOf(r)) {
         t.step = 0; // rebuild
         if (!res.ok) dropMesh(t);
       }
@@ -277,6 +342,7 @@ export function create({ container, makeMarker, onHover, onChange }) {
       for (const [dx, dz] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
         const n = regions.get(`${r.x + dx},${r.z + dz}`);
         if (!n) continue;
+        if (n.whole) n.whole.step = 0;
         for (const t of n.tiles) {
           const edge = dx === -1 ? t.tx === TILES - 1 : dx === 1 ? t.tx === 0 : dz === -1 ? t.tz === TILES - 1 : t.tz === 0;
           if (edge) t.step = 0;
@@ -299,6 +365,11 @@ export function create({ container, makeMarker, onHover, onChange }) {
     });
   }
 
+  /** All mesh slots of a region: its 16 tiles and the whole-region mesh (if any). */
+  const meshesOf = (r) => (r.whole ? [...r.tiles, r.whole] : r.tiles);
+  const tilesReady = (r) => r.tiles.every((t) => t.step && !t.building);
+
+  /** Build one mesh slot: a tile of TILE blocks, or with `t.whole` the whole region (far away). */
   async function buildMesh(r, t, step) {
     t.building = true;
     building++;
@@ -308,27 +379,48 @@ export function create({ container, makeMarker, onHover, onChange }) {
       const w = workers.reduce((a, b) => (b.busy < a.busy ? b : a));
       w.busy++;
       const m = await askOne(w, `mesh:${id}`, {
-        type: "build", key: r.key, rx: r.x, rz: r.z, step, x0: t.tx * TILE, z0: t.tz * TILE, size: TILE, id,
-        fine: neighbourTiles(r, t).map((n) => !!n && n.step === 1),
+        type: "build", key: r.key, rx: r.x, rz: r.z, step, id, slice: options.slice,
+        x0: t.whole ? 0 : t.tx * TILE, z0: t.whole ? 0 : t.tz * TILE, size: t.whole ? SIZE : TILE,
+        fine: t.whole ? [false, false, false, false] : neighbourTiles(r, t).map((n) => !!n && n.step === 1),
       }).finally(() => w.busy--);
       if (m.error) console.error("3D mesh", r.key, m.error);
       if (d !== dim || regions.get(`${r.x},${r.z}`) !== r) return;
       dropMesh(t);
-      if (!m.opaque && !m.cutout && !m.water) return;
+      if (t.whole) {
+        if (r.mode === "whole") {
+          // the region is one mesh now: its tiles go (and are rebuilt when it comes closer)
+          for (const tl of r.tiles) {
+            dropMesh(tl);
+            tl.step = 0;
+          }
+        } else if (tilesReady(r)) {
+          r.whole = null; // came back closer meanwhile and the tiles are there already
+          return;
+        }
+      } else if (r.whole && r.mode !== "whole" && tilesReady(r)) {
+        dropMesh(r.whole); // the tiles replace the whole-region mesh
+        r.whole = null;
+      }
+      if (!PARTS.some((part) => m[part])) return;
       // positions are in 1/16 block, relative to the region origin
       const group = new THREE.Group();
       group.position.set(r.x * SIZE, 0, r.z * SIZE);
       group.scale.setScalar(1 / 16);
-      for (const part of ["opaque", "cutout", "water"]) {
+      for (const part of PARTS) {
         const p = m[part];
         if (!p) continue;
         const g = new THREE.BufferGeometry();
         g.setAttribute("position", new THREE.BufferAttribute(p.position, 3));
         g.setAttribute("color", new THREE.BufferAttribute(p.color, 3, true));
         g.setAttribute("uv", new THREE.BufferAttribute(p.uv, 2));
+        g.setAttribute("tex", new THREE.BufferAttribute(p.tex, 1));
         g.setIndex(new THREE.BufferAttribute(p.index, 1));
         g.computeBoundingSphere();
+        // once on the GPU the arrays are not needed here any more (nothing reads them back)
+        for (const a of [...Object.values(g.attributes), g.index]) a.onUpload(freeArray);
         const mesh = new THREE.Mesh(g, materials[part]);
+        mesh.userData.part = part;
+        mesh.visible = options[part] !== false;
         if (part === "water") mesh.renderOrder = 1; // after everything it lets shine through
         group.add(mesh);
       }
@@ -353,13 +445,14 @@ export function create({ container, makeMarker, onHover, onChange }) {
   }
 
   function unload(key, r) {
-    r.tiles.forEach(dropMesh);
+    meshesOf(r).forEach(dropMesh);
     broadcast({ type: "drop", key: r.key });
     regions.delete(key);
   }
 
   // ----- which regions, which detail -----
 
+  const frustum = new THREE.Frustum(), projView = new THREE.Matrix4(), box = new THREE.Box3();
   let updateTimer = 0;
   function scheduleUpdate() {
     if (!updateTimer) updateTimer = setTimeout(() => { updateTimer = 0; update(); }, 50);
@@ -368,8 +461,8 @@ export function create({ container, makeMarker, onHover, onChange }) {
   // fog and far plane move with the camera distance, so zooming out never hides everything
   function updateFog(radius) {
     const d = camera.position.distanceTo(controls.target);
-    scene.fog.near = d + radius * 0.4;
-    scene.fog.far = d + radius;
+    scene.fog.near = options.fog ? d + radius * 0.4 : 1e7;
+    scene.fog.far = options.fog ? d + radius : 2e7;
     camera.far = d + radius * 1.2;
     camera.near = Math.max(0.5, d / 400);
     camera.updateProjectionMatrix();
@@ -378,6 +471,23 @@ export function create({ container, makeMarker, onHover, onChange }) {
   function update() {
     if (!active || !bounds || stamp === null) return;
     const t = controls.target, cam = camera.position;
+    // what the camera sees: tiles outside get half the detail and come last
+    camera.updateMatrixWorld();
+    projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projView);
+    const seen = (x0, z0, size) => {
+      box.min.set(x0 - 24, -64, z0 - 24);
+      box.max.set(x0 + size + 24, 320, z0 + size + 24);
+      return frustum.intersectsBox(box);
+    };
+    // the step thresholds are for a ~900 px high view: a smaller window needs less detail
+    const scale = Math.min(2, Math.max(0.5, container.clientHeight / 900));
+    const want = (dist, visible) => {
+      const s = stepFor(dist / scale);
+      return visible ? s : Math.min(16, Math.max(2, s * 2));
+    };
+    // height of the camera above the ground (for the distance to tiles)
+    const above = Math.max(0, cam.y - (groundBelow(cam) ?? t.y));
     const radius = Math.min(MAX_RADIUS, Math.max(1024, cam.distanceTo(t) * 2.5));
     updateFog(radius);
     const [minX, minZ, maxX, maxZ] = bounds;
@@ -394,7 +504,7 @@ export function create({ container, makeMarker, onHover, onChange }) {
     wanted.sort((a, b) => a.d - b.d);
     const keep = new Set(wanted.map((w) => w.key));
     for (const [key, r] of regions) {
-      if (!keep.has(key) && r.state !== "loading" && !r.tiles.some((tl) => tl.building)) unload(key, r);
+      if (!keep.has(key) && r.state !== "loading" && !meshesOf(r).some((tl) => tl.building)) unload(key, r);
     }
 
     let pending = false;
@@ -406,6 +516,8 @@ export function create({ container, makeMarker, onHover, onChange }) {
         for (let tz = 0; tz < TILES; tz++) for (let tx = 0; tx < TILES; tx++) r.tiles.push({ tx, tz, step: 0 });
         regions.set(w.key, r);
       }
+      // slice switched on/off while every-cave stacks exist: the other stack files are needed
+      if (stamp && r.state === "ready" && r.voxelSet !== voxelSet()) r.stale = true;
       if (r.state === "new" || r.stale) {
         pending = true;
         if (loading < PARALLEL && r.state !== "loading") {
@@ -415,18 +527,34 @@ export function create({ container, makeMarker, onHover, onChange }) {
         continue;
       }
       if (r.state !== "ready") continue;
+      // far away the whole region is one mesh (with ±10 % hysteresis on the switch)
+      {
+        const x0 = r.x * SIZE, z0 = r.z * SIZE;
+        const nx = Math.min(Math.max(cam.x, x0), x0 + SIZE), nz = Math.min(Math.max(cam.z, z0), z0 + SIZE);
+        const dist = Math.hypot(nx - cam.x, nz - cam.z, above), vis = seen(x0, z0, SIZE);
+        r.mode = want(dist * (r.mode === "whole" ? 1.1 : 0.9), vis) >= WHOLE_FROM ? "whole" : "tiles";
+        if (r.mode === "whole") {
+          const W = (r.whole ||= { whole: true, step: 0 });
+          const step = want(dist, vis);
+          const settled = want(dist * 0.9, vis) === want(dist * 1.1, vis);
+          if (!W.building && (W.dirty || !W.step || (step !== W.step && settled))) {
+            todo.push({ r, tl: W, step, d: Math.hypot(nx - cam.x, nz - cam.z) + (vis ? 0 : 1e6) });
+          }
+          continue;
+        }
+      }
       for (const tl of r.tiles) {
         // nearest point of the tile to the camera
         const x0 = r.x * SIZE + tl.tx * TILE, z0 = r.z * SIZE + tl.tz * TILE;
         const nx = Math.min(Math.max(cam.x, x0), x0 + TILE), nz = Math.min(Math.max(cam.z, z0), z0 + TILE);
-        const dist = Math.hypot(nx - cam.x, nz - cam.z, t.y - cam.y);
-        const step = stepFor(dist);
+        const dist = Math.hypot(nx - cam.x, nz - cam.z, above), vis = seen(x0, z0, TILE);
+        const step = want(dist, vis);
         // near a threshold keep what is built: no rebuilding back and forth while moving
-        if (!tl.dirty && (step === tl.step || (tl.step && stepFor(dist * 0.9) !== stepFor(dist * 1.1)))) continue;
-        todo.push({ r, tl, step, d: Math.hypot(nx - cam.x, nz - cam.z) });
+        if (!tl.dirty && (step === tl.step || (tl.step && want(dist * 0.9, vis) !== want(dist * 1.1, vis)))) continue;
+        todo.push({ r, tl, step, d: Math.hypot(nx - cam.x, nz - cam.z) + (vis ? 0 : 1e6) });
       }
     }
-    // nearest tiles first
+    // what is in view first, nearest first
     todo.sort((a, b) => a.d - b.d);
     for (const { r, tl, step } of todo) {
       pending = true;
@@ -434,7 +562,7 @@ export function create({ container, makeMarker, onHover, onChange }) {
       if (tl.building) continue;
       // full-detail tiles draw "just in case" faces only towards coarser neighbours: when this
       // tile starts or stops being full detail, its full-detail neighbours are rebuilt
-      if ((tl.step === 1) !== (step === 1)) {
+      if (!tl.whole && (tl.step === 1) !== (step === 1)) {
         for (const n of neighbourTiles(r, tl)) if (n && n.step === 1) n.dirty = true;
       }
       tl.step = step;
@@ -468,16 +596,22 @@ export function create({ container, makeMarker, onHover, onChange }) {
 
   // Never inside the terrain (zooming into a ravine would put the camera into the rock, from where
   // nothing is visible): at least 2 blocks above the highest block around the camera
+  /** Highest block top at and around p (null if unknown). */
+  function groundBelow(p) {
+    let top = null;
+    for (const [dx, dz] of [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]]) {
+      const h = heightAt(p.x + dx, p.z + dz);
+      if (h != null && (top == null || h > top)) top = h;
+    }
+    return top;
+  }
+
   let lifting = false;
   function keepAboveGround() {
     if (lifting) return;
     const p = camera.position;
-    let top = -Infinity;
-    for (const [dx, dz] of [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]]) {
-      const h = heightAt(p.x + dx, p.z + dz);
-      if (h != null && h > top) top = h;
-    }
-    if (!Number.isFinite(top) || p.y >= top + 2) return;
+    const top = groundBelow(p);
+    if (top == null || p.y >= top + 2) return;
     lifting = true;
     p.y = top + 2;
     controls.update();
@@ -485,24 +619,66 @@ export function create({ container, makeMarker, onHover, onChange }) {
   }
 
   // ----- markers -----
+  // HTML markers (name + head) over the canvas. Players with a skin also get a 3D model, shown
+  // instead of the head while the camera is closer than MODEL_NEAR blocks (the name stays above).
+
+  const MODEL_NEAR = 72;
+  const models = new Map(); // player name -> {group, skin}
 
   function setMarkers(list) {
     overlay.replaceChildren();
+    const seen = new Set();
     markers = list.map((m) => {
       const wrap = document.createElement("div");
       wrap.className = "marker3d";
-      wrap.append(makeMarker(m.name, m.kind));
+      wrap.append(makeMarker(m.name, m.kind, m.skin));
       overlay.append(wrap);
-      return { el: wrap, x: m.x, y: m.y, z: m.z };
+      let model = null;
+      if (m.kind === "player" && m.skin) {
+        seen.add(m.name);
+        let entry = models.get(m.name);
+        if (entry && entry.skin !== m.skin) {
+          scene.remove(entry.group);
+          disposeModel(entry.group);
+          entry = null;
+        }
+        if (!entry) {
+          entry = { skin: m.skin, group: playerModel(`skins/${m.skin}.png`, requestRender) };
+          entry.group.visible = false;
+          scene.add(entry.group);
+          models.set(m.name, entry);
+        }
+        model = entry.group;
+      }
+      return { el: wrap, x: m.x, y: m.y, z: m.z, model };
     });
+    for (const [name, entry] of models) {
+      if (!seen.has(name)) {
+        scene.remove(entry.group);
+        disposeModel(entry.group);
+        models.delete(name);
+      }
+    }
     requestRender();
   }
 
   const v = new THREE.Vector3();
   function placeMarkers() {
+    camera.updateMatrixWorld();
     const w = container.clientWidth, h = container.clientHeight;
     for (const m of markers) {
-      const y = m.y ?? heightAt(m.x, m.z) ?? controls.target.y;
+      let y = m.y ?? heightAt(m.x, m.z) ?? controls.target.y;
+      if (m.model) {
+        const near = options.players !== false && camera.position.distanceTo(v.set(m.x, y, m.z)) < MODEL_NEAR;
+        m.model.visible = near;
+        m.el.classList.toggle("near", near);
+        if (near) {
+          m.model.position.set(m.x, y, m.z);
+          // no facing direction is known: turn towards the camera
+          m.model.rotation.y = Math.atan2(camera.position.x - m.x, camera.position.z - m.z);
+          y += 2; // the name above the model's head
+        }
+      }
       v.set(m.x, y, m.z).project(camera);
       const visible = v.z < 1 && Math.abs(v.x) < 1.2 && Math.abs(v.y) < 1.2;
       m.el.style.display = visible ? "" : "none";
@@ -514,8 +690,8 @@ export function create({ container, makeMarker, onHover, onChange }) {
 
   function draw() {
     frame = 0;
+    placeMarkers(); // first: places the player models for this frame
     renderer.render(scene, camera);
-    placeMarkers();
   }
 
   controls.addEventListener("change", () => {
@@ -546,6 +722,174 @@ export function create({ container, makeMarker, onHover, onChange }) {
       }
     }
   });
+
+  // ----- looking around (right drag, or Ctrl + left drag) -----
+  // Turns the view direction about the camera's own position (yaw/pitch, like a player's head);
+  // the orbit centre stays at the same distance in the new direction.
+
+  const LOOK_SPEED = 0.005; // radians per pixel
+  const MAX_PITCH = THREE.MathUtils.degToRad(85);
+  const lookDir = new THREE.Vector3(), move = new THREE.Vector3();
+  let look = null; // {id, x, y}
+  renderer.domElement.addEventListener("pointerdown", (e) => {
+    if (!(e.button === 2 || (e.button === 0 && e.ctrlKey)) || e.pointerType === "touch") return;
+    e.preventDefault();
+    e.stopImmediatePropagation(); // MapControls must not start a pan for Ctrl + left
+    look = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    renderer.domElement.setPointerCapture(e.pointerId);
+  }, { capture: true });
+  renderer.domElement.addEventListener("pointermove", (e) => {
+    if (!look || e.pointerId !== look.id) return;
+    const dx = e.clientX - look.x, dy = e.clientY - look.y;
+    look.x = e.clientX;
+    look.y = e.clientY;
+    turn(-dx * LOOK_SPEED, -dy * LOOK_SPEED);
+  });
+  const endLook = (e) => {
+    if (look && e.pointerId === look.id) look = null;
+  };
+  renderer.domElement.addEventListener("pointerup", endLook);
+  renderer.domElement.addEventListener("pointercancel", endLook);
+  renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  /** Turn the view by `dYaw` (left/right) and `dPitch` (up/down), keeping the camera in place. */
+  function turn(dYaw, dPitch) {
+    lookDir.subVectors(controls.target, camera.position);
+    const dist = lookDir.length() || 1;
+    let yaw = Math.atan2(lookDir.x, lookDir.z);
+    let pitch = Math.asin(Math.max(-1, Math.min(1, lookDir.y / dist)));
+    yaw += dYaw;
+    pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, pitch + dPitch));
+    lookDir.set(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+    controls.target.copy(camera.position).addScaledVector(lookDir, dist);
+    controls.update();
+  }
+
+  // ----- gliding (follow mode) -----
+  // Moves orbit centre and camera together towards (x, y, z) over `ms` milliseconds, linearly, so
+  // a followed player (positions every ~2 s) is tracked without jumps. View angle and distance stay.
+
+  let glideFrame = 0;
+  function glide(x, y, z, ms = 0) {
+    cancelAnimationFrame(glideFrame);
+    const from = controls.target.clone(), t0 = performance.now();
+    const step = (now) => {
+      const t = ms > 0 ? Math.min(1, (now - t0) / ms) : 1;
+      move.set(from.x + (x - from.x) * t, from.y + (y - from.y) * t, from.z + (z - from.z) * t).sub(controls.target);
+      controls.target.add(move);
+      camera.position.add(move);
+      controls.update();
+      glideFrame = t < 1 && active ? requestAnimationFrame(step) : 0;
+    };
+    glideFrame = requestAnimationFrame(step);
+  }
+  // any drag by the user ends a glide (it would fight the pan)
+  renderer.domElement.addEventListener("pointerdown", () => {
+    cancelAnimationFrame(glideFrame);
+    glideFrame = 0;
+  });
+
+  // ----- flying with the keyboard -----
+
+  const FLY_KEYS = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "ShiftLeft", "ShiftRight"]);
+  // Any number of keys at once (e.g. W + D + Space). W/S move along the view direction (also up or
+  // down when the camera is tilted), A/D sideways, Space/Shift straight up/down; camera and orbit
+  // centre move together, so the view keeps its angle.
+  const keys = new Set();
+  let flyFrame = 0, flyLast = 0;
+  const fwd = new THREE.Vector3(), side = new THREE.Vector3();
+  const typing = (e) => e.target instanceof Element && !!e.target.closest("input, select, textarea, [contenteditable]");
+  window.addEventListener("keydown", (e) => {
+    if (!active || e.ctrlKey || e.metaKey || e.altKey || !FLY_KEYS.has(e.code) || typing(e)) return;
+    e.preventDefault(); // no page scrolling, no "click" on a focused button with Space
+    if (document.activeElement instanceof HTMLButtonElement) document.activeElement.blur();
+    keys.add(e.code);
+    if (!flyFrame) {
+      flyLast = performance.now();
+      flyFrame = requestAnimationFrame(fly);
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (keys.delete(e.code)) e.preventDefault();
+  });
+  window.addEventListener("blur", () => keys.clear());
+  document.addEventListener("visibilitychange", () => keys.clear());
+
+  function fly(now) {
+    flyFrame = 0;
+    if (!keys.size || !active) return;
+    const dt = Math.min(0.1, (now - flyLast) / 1000);
+    flyLast = now;
+    camera.updateMatrixWorld();
+    fwd.setFromMatrixColumn(camera.matrixWorld, 2).negate().normalize(); // view direction
+    side.setFromMatrixColumn(camera.matrixWorld, 0).normalize();          // screen right
+    const has = (...codes) => codes.some((c) => keys.has(c));
+    move.set(0, 0, 0);
+    if (has("KeyW", "ArrowUp")) move.add(fwd);
+    if (has("KeyS", "ArrowDown")) move.sub(fwd);
+    if (has("KeyD", "ArrowRight")) move.add(side);
+    if (has("KeyA", "ArrowLeft")) move.sub(side);
+    if (has("Space")) move.y += 1;
+    if (has("ShiftLeft", "ShiftRight")) move.y -= 1;
+    if (move.lengthSq() > 0) {
+      move.normalize().multiplyScalar(options.flySpeed * dt);
+      camera.position.add(move);
+      controls.target.add(move);
+      // not into the ground: lift both, so flying along a slope keeps the view angle
+      const ground = groundBelow(camera.position);
+      if (ground != null && camera.position.y < ground + 2) {
+        const dy = ground + 2 - camera.position.y;
+        camera.position.y += dy;
+        controls.target.y += dy;
+      }
+      controls.update();
+    }
+    flyFrame = requestAnimationFrame(fly);
+  }
+
+  // Mouse wheel while a fly key is held: flight speed instead of zoom (×1.25 per notch)
+  container.addEventListener("wheel", (e) => {
+    if (!active || !keys.size || !e.deltaY) return;
+    e.preventDefault();
+    e.stopPropagation(); // capture phase on the container: MapControls never sees it
+    const notches = Math.sign(e.deltaY) * Math.min(4, Math.max(1, Math.abs(e.deltaY) / 100));
+    const speed = options.flySpeed * Math.pow(1.25, -notches);
+    options.flySpeed = Math.round(Math.min(FLY_SPEED.max, Math.max(FLY_SPEED.min, speed)) * 10) / 10;
+    onSpeed?.(options.flySpeed);
+  }, { capture: true, passive: false });
+
+  // ----- options -----
+
+  let sliceTimer = 0;
+  function setOptions(next) {
+    const sliceBefore = JSON.stringify(options.slice);
+    Object.assign(options, next);
+    for (const r of regions.values()) {
+      for (const t of meshesOf(r)) {
+        for (const m of t.mesh ? t.mesh.children : []) m.visible = options[m.userData.part] !== false;
+      }
+    }
+    if (JSON.stringify(options.slice) !== sliceBefore) {
+      const s = options.slice;
+      if (s) {
+        clipTop.constant = s.hi + 0.02;
+        clipBottom.constant = -s.lo;
+      }
+      for (const m of new Set(Object.values(materials))) {
+        m.clippingPlanes = s ? [clipTop, clipBottom] : null;
+        m.needsUpdate = true;
+      }
+      keepAboveGround();
+      // rebuild with cut faces once the slider rests
+      clearTimeout(sliceTimer);
+      sliceTimer = setTimeout(() => {
+        for (const r of regions.values()) for (const t of meshesOf(r)) t.dirty = true;
+        scheduleUpdate();
+      }, 250);
+    }
+    if (active) update();
+    requestRender();
+  }
 
   // ----- public API -----
 
@@ -586,6 +930,31 @@ export function create({ container, makeMarker, onHover, onChange }) {
       scheduleUpdate();
     },
     setMarkers,
+    setOptions,
+    /** Move the view to (x, y, z) over `ms` milliseconds (follow mode), keeping angle and distance. */
+    glide,
+    /** Numbers for tuning (DevTools: state.view3d.stats). */
+    get stats() {
+      const steps = {}, parts = {};
+      let tiles = 0;
+      for (const r of regions.values()) {
+        for (const t of meshesOf(r)) {
+          if (!t.mesh) continue;
+          tiles++;
+          const s = t.whole ? `${t.step} (region)` : t.step;
+          steps[s] = (steps[s] || 0) + 1;
+          for (const m of t.mesh.children) {
+            const k = `${m.userData.part}@${t.step}`;
+            parts[k] = (parts[k] || 0) + m.geometry.index.count / 3;
+          }
+        }
+      }
+      const { calls, triangles } = renderer.info.render;
+      return {
+        regions: regions.size, tiles, steps, calls, triangles, parts,
+        geometries: renderer.info.memory.geometries, workers: POOL, shared: self.crossOriginIsolated,
+      };
+    },
     get center() {
       return { x: controls.target.x, z: controls.target.z, distance: camera.position.distanceTo(controls.target) };
     },

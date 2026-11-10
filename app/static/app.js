@@ -1,23 +1,42 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
 const MAX_LINES = 1000;
+const SPARK_POINTS = 90; // stats arrive every 2 s: 3 minutes
 const ICONS = "/static/icons.svg";
-const FLAVOR_NAME = { vanilla: "Vanilla", paper: "Paper" };
+const FLAVOR_NAME = { vanilla: "Vanilla", paper: "Paper", fabric: "Fabric" };
+const PAGES = { overview: "Overview", players: "Players", addons: "Add-ons", world: "World & backups", server: "Server" };
+const LEVELS = ["info", "warn", "err", "chat", "gui"];
 
 const ui = {
+  sid: null,          // selected server id (see instances.py)
+  page: "overview",
+  servers: [],        // [{ id, name, state, port, flavor, version, has_map, ... }]
+  server: null,       // { id, name, port, has_map } of the selected server
   status: null,
-  settings: null,   // saved settings from the server
-  world: {},        // { version, flavor, rank } that last ran the world
-  installed: [],    // [{ flavor, version, build, size_mb, rank }]
-  sel: null,        // unsaved selection { flavor, version }
-  versions: [],     // version list for the selected flavor
+  settings: null,     // saved settings of the selected server
+  world: {},          // { version, flavor, rank } that last ran the world
+  installed: [],      // [{ flavor, version, build, size_mb, rank }] (shared by all servers)
+  sel: null,          // unsaved selection { flavor, version }
+  versions: [],       // version list for the selected flavor
   latest: null,
+  access: null,
+  datapacks: null,
+  addons: null,       // { kind: "mods" | "plugins" | null, version, running, items }
+  addonUpdates: null, // { file: { version } } from the last update check
+  atab: store("panel.addonTab") || "datapacks",
   history: [],
   historyPos: 0,
+  ptab: "online",
+  spark: { cpu: [], ram: [] },
+  logCounts: {},
   ws: null,
   wsRetry: 1000,
 };
+
+/** URL of a per-server API endpoint. */
+const S = (path = "") => `/api/servers/${encodeURIComponent(ui.sid)}${path}`;
 
 // ---------- helpers ----------
 
@@ -49,7 +68,7 @@ function toast(msg, isError = false) {
 function fmtDuration(sec) {
   if (!sec) return "";
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
-  return h ? `up ${h}h ${m}m` : `up ${m}m`;
+  return h ? `up ${h} h ${m} min` : `up ${m} min`;
 }
 
 function fmtMB(mb) {
@@ -76,11 +95,103 @@ function icon(name, cls = "i") {
   return svg;
 }
 
+/** Panel-styled replacement for confirm(): resolves true when the action button is used
+ *  (Escape, Cancel or a click on the backdrop = false). */
+let askDialog = null;
+function ask({ title, text = "", ok = "OK", danger = false, iconName = null }) {
+  if (!askDialog) {
+    askDialog = el("dialog", { className: "dialog ask-dialog" });
+    askDialog.addEventListener("click", (e) => { if (e.target === askDialog) askDialog.close(""); });
+    document.body.append(askDialog);
+  }
+  const cancel = el("button", { type: "button", className: "btn ghost", textContent: "Cancel" });
+  const go = el("button", { type: "button", className: `btn ${danger ? "danger" : "primary"}` },
+    iconName ? icon(iconName) : null, ok);
+  cancel.addEventListener("click", () => askDialog.close(""));
+  go.addEventListener("click", () => askDialog.close("ok"));
+  askDialog.replaceChildren(el("form", { method: "dialog" },
+    el("div", { className: "card-head" }, el("h2", { textContent: title })),
+    ...text.split("\n").filter(Boolean).map((line, i) => el("p", { className: i ? "muted" : "", textContent: line })),
+    el("div", { className: "dialog-actions" }, el("span"), cancel, go)));
+  askDialog.returnValue = "";
+  askDialog.showModal();
+  go.focus();
+  return new Promise((resolve) => askDialog.addEventListener("close", () => resolve(askDialog.returnValue === "ok"), { once: true }));
+}
+
 function tag(text, cls = "", iconName = null) {
   return el("span", { className: `tag ${cls}` }, iconName ? icon(iconName) : null, text);
 }
 
 const flavorLabel = (f, v) => `${FLAVOR_NAME[f] || f} ${v}`;
+
+/** Stable pastel colour per name (shown until / instead of the skin head). */
+function nameColor(name) {
+  let h = 0;
+  for (const c of name.toLowerCase()) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return `hsl(${h} 62% 72%)`;
+}
+
+// Skin heads: the panel hands out the skin PNG (from Mojang, cached), the face is cut out here
+const heads = new Map(); // "<server>/<name>" -> Promise<data URL | null>
+
+function headUrl(name) {
+  if (!/^\w{3,16}$/.test(name)) return Promise.resolve(null);
+  const key = `${ui.sid}/${name.toLowerCase()}`;
+  if (!heads.has(key)) {
+    heads.set(key, (async () => {
+      const res = await fetch(S(`/players/${encodeURIComponent(name)}/skin`), { credentials: "same-origin" });
+      if (!res.ok) return null;
+      const skin = await createImageBitmap(await res.blob());
+      const c = document.createElement("canvas");
+      c.width = c.height = 8;
+      const g = c.getContext("2d", { willReadFrequently: true });
+      // Hat layer first, alone: old 64×32 skins often fill it opaque (Minecraft ignores it then)
+      g.drawImage(skin, 40, 8, 8, 8, 0, 0, 8, 8);
+      const hat = g.getImageData(0, 0, 8, 8);
+      const opaque = hat.data.every((v, i) => i % 4 !== 3 || v === 255);
+      g.clearRect(0, 0, 8, 8);
+      g.drawImage(skin, 8, 8, 8, 8, 0, 0, 8, 8);    // face
+      if (!(skin.height === 32 && opaque)) g.drawImage(skin, 40, 8, 8, 8, 0, 0, 8, 8);
+      return c.toDataURL();
+    })().catch(() => null));
+  }
+  return heads.get(key);
+}
+
+function avatar(name, small = false, big = false) {
+  const a = el("span", { className: "avatar" + (small ? " small" : "") + (big ? " big" : ""), textContent: name[0].toUpperCase(), title: name });
+  a.style.background = nameColor(name);
+  a.setAttribute("aria-hidden", "true");
+  headUrl(name).then((url) => {
+    if (!url) return;
+    a.textContent = "";
+    a.classList.add("head");
+    a.style.background = `center / cover no-repeat url(${url})`;
+  });
+  return a;
+}
+
+/** A player name that opens the profile. */
+function playerName(name, cls = "title") {
+  const b = el("button", { type: "button", className: `link-btn ${cls}`, textContent: name, title: `Profile of ${name}` });
+  b.addEventListener("click", () => openProfile(name));
+  return b;
+}
+
+function switchInput(checked, label, onChange, disabled = false) {
+  const input = el("input", { type: "checkbox", checked, disabled, role: "switch", ariaLabel: label });
+  input.addEventListener("change", () => onChange(input));
+  return el("label", { className: "switch", title: label }, input, el("span", { className: "track" }));
+}
+
+function store(key, value) {
+  try {
+    if (value === undefined) return JSON.parse(localStorage.getItem(key));
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch { /* storage blocked: only a convenience */ }
+  return null;
+}
 
 // ---------- login ----------
 
@@ -108,6 +219,195 @@ $("#logout").addEventListener("click", async () => {
   showLogin();
 });
 
+// ---------- routing: #/<server>/<page> ----------
+
+function parseHash() {
+  const [, sid, page] = location.hash.match(/^#\/([a-z0-9-]+)(?:\/(\w+))?/) || [];
+  return { sid, page: PAGES[page] ? page : "overview" };
+}
+
+function go(sid, page = ui.page) {
+  location.hash = `#/${sid}/${page}`;
+}
+
+async function route() {
+  let { sid, page } = parseHash();
+  if (!ui.servers.some((s) => s.id === sid)) sid = ui.servers.some((s) => s.id === ui.sid) ? ui.sid : "main";
+  const changed = sid !== ui.sid;
+  ui.page = page;
+  if (changed) await switchServer(sid);
+  showPage();
+  if (location.hash !== `#/${sid}/${page}`) history.replaceState(null, "", `#/${sid}/${page}`);
+}
+
+window.addEventListener("hashchange", () => route().catch((err) => toast(err.message, true)));
+
+function showPage() {
+  for (const p of $$(".page")) p.classList.toggle("hidden", p.dataset.page !== ui.page);
+  for (const a of $$(".nav a[data-page]")) {
+    a.href = `#/${ui.sid}/${a.dataset.page}`;
+    if (a.dataset.page === ui.page) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  }
+  $("#page-title").textContent = PAGES[ui.page];
+  document.title = `${ui.server?.name || "Server"} · ${PAGES[ui.page]} · Server Panel`;
+  if (ui.page === "players") loadAccess();
+  if (ui.page === "server") showServerIcon();
+  if (ui.page === "world") loadCaveReach();
+  if (ui.page === "addons") showAddonTab(ui.atab);
+}
+
+async function switchServer(sid) {
+  ui.sid = sid;
+  ui.server = null;
+  ui.status = null;
+  ui.sel = null;
+  ui.versions = [];
+  ui.access = null;
+  ui.datapacks = null;
+  ui.addons = null;
+  ui.addonUpdates = null;
+  $("#mr-results").replaceChildren();
+  ui.spark = { cpu: [], ram: [] };
+  $("#history-card").classList.add("hidden");
+  closeProfile(); // the profile belongs to the previous server
+  ui.history = [];
+  ui.historyPos = 0;
+  renderServerList();
+  drawSpark("#spark-cpu", [], 100);
+  drawSpark("#spark-ram", [], 1);
+  await loadState(true);
+}
+
+// ---------- server list (sidebar) ----------
+
+async function loadServers() {
+  ui.servers = await api("/api/servers");
+  renderServerList();
+}
+
+function renderServerList() {
+  const ul = $("#server-list");
+  ul.replaceChildren(...ui.servers.map((s) => {
+    const a = el("a", {
+      className: "server-item", href: `#/${s.id}/${ui.page}`,
+      title: `${s.name} — ${s.state}${s.port ? ` · port ${s.port}` : ""}`,
+    },
+    el("span", { className: `server-icon ${s.flavor}`, textContent: s.name[0].toUpperCase() }),
+    el("span", { className: "server-text" },
+      el("b", { textContent: s.name }),
+      el("span", { textContent: [s.version ? flavorLabel(s.flavor, s.version) : FLAVOR_NAME[s.flavor], `:${s.port}`].join(" · ") })),
+    el("span", { className: `dot-state ${s.state}`, title: s.state }));
+    if (s.id === ui.sid) a.setAttribute("aria-current", "true");
+    return el("li", {}, a);
+  }));
+  $("#server-count").textContent = ui.servers.length === 1 ? "1 server" : `${ui.servers.length} servers`;
+}
+
+/** Status event of any server: keep its dot in the sidebar current. */
+function updateServerEntry(status) {
+  const s = ui.servers.find((x) => x.id === status.server);
+  if (!s) return;
+  const players = status.players.length;
+  if (s.state === status.state && s.task === status.task && s.players === players) return;
+  Object.assign(s, { state: status.state, task: status.task, players });
+  renderServerList();
+}
+
+// ---------- new server ----------
+
+const serverDialog = $("#server-dialog");
+
+async function loadNewServerVersions() {
+  const flavor = $('input[name="ns-flavor"]:checked').value;
+  const select = $("#ns-version");
+  select.replaceChildren(el("option", { value: "", textContent: "Loading…" }));
+  try {
+    const data = await api(`/api/versions?flavor=${flavor}&snapshots=false`);
+    select.replaceChildren(...data.versions.map((v) => el("option", {
+      value: v.id, textContent: v.id + (v.id === data.latest ? " (latest)" : ""), selected: v.id === data.latest,
+    })));
+  } catch (err) {
+    // Offline: offer what is already downloaded (or choose later on the Server page)
+    const local = ui.installed.filter((i) => i.flavor === flavor);
+    select.replaceChildren(el("option", { value: "", textContent: "Choose later" }),
+      ...local.map((i) => el("option", { value: i.version, textContent: i.version })));
+    toast(err.message, true);
+  }
+}
+
+$("#new-server-btn").addEventListener("click", () => {
+  $("#ns-name").value = "";
+  serverDialog.showModal();
+  loadNewServerVersions();
+});
+$$('input[name="ns-flavor"]').forEach((r) => r.addEventListener("change", loadNewServerVersions));
+serverDialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => serverDialog.close()));
+
+$("#server-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const created = await api("/api/servers", {
+      method: "POST",
+      body: {
+        name: $("#ns-name").value, flavor: $('input[name="ns-flavor"]:checked').value,
+        version: $("#ns-version").value, min_ram: $("#ns-min").value, max_ram: $("#ns-max").value,
+      },
+    });
+    serverDialog.close();
+    await loadServers();
+    toast(`${created.name} created (game port ${created.port})`);
+    go(created.id, "server");
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("#rename-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const s = await api(S(), { method: "PATCH", body: { name: $("#server-rename").value } });
+    ui.server.name = s.name;
+    await loadServers();
+    renderServerInfo();
+    toast("Renamed");
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("#delete-server-btn").addEventListener("click", async () => {
+  const name = ui.server?.name;
+  const typed = prompt(`Delete the server "${name}"?\n\nIts world and settings are deleted. Its backups are kept.\n` +
+                       "Type the server name to confirm:");
+  if (typed === null) return;
+  if (typed.trim() !== name) return toast("The name did not match, nothing was deleted", true);
+  try {
+    await api(S(), { method: "DELETE" });
+    await loadServers();
+    toast(`${name} deleted`);
+    go("main", "overview");
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+function renderServerInfo() {
+  const s = ui.server;
+  if (!s) return;
+  $("#server-name").textContent = s.name;
+  $("#server-rename").value = s.name;
+  $("#port-label").textContent = `port ${s.port}`;
+  $("#fact-port").textContent = s.port;
+  $("#fact-id").textContent = s.id === "main" ? "data/server" : `data/servers/${s.id}`;
+  $("#delete-server-btn").classList.toggle("hidden", s.id === "main");
+  // every server has its own live map (has_map stays as a flag for the API)
+  $("#map-box").classList.toggle("hidden", !s.has_map);
+  $("#map-note").textContent = s.has_map ? "" : "The live map is only available for the first server (for now).";
+  $("#world-map-note").textContent = (s.has_map ? "The live map is reset. " : "") + "The new world is generated on the next start.";
+  document.title = `${s.name} · ${PAGES[ui.page]} · Server Panel`;
+}
+
 // ---------- console & chat ----------
 
 function lineClass(line) {
@@ -115,30 +415,97 @@ function lineClass(line) {
   if (/(\/| )(ERROR|FATAL)\]|Exception/.test(line)) return "err";
   if (/(\/| )WARN\]/.test(line)) return "warn";
   if (/\]: (\[Not Secure\] )?<\w+>/.test(line)) return "chat";
-  return "";
+  return "info";
 }
+
+const logQuery = () => $("#log-search").value.trim().toLowerCase();
 
 function appendLog(lines) {
   const con = $("#console");
+  const q = logQuery();
   const frag = document.createDocumentFragment();
-  for (const line of lines) frag.append(el("span", { className: lineClass(line), textContent: line + "\n" }));
+  for (const line of lines) {
+    const cls = lineClass(line);
+    ui.logCounts[cls] = (ui.logCounts[cls] || 0) + 1;
+    const span = el("span", { className: cls, textContent: line });
+    if (q && !line.toLowerCase().includes(q)) span.classList.add("nomatch");
+    frag.append(span);
+  }
   con.append(frag);
-  while (con.childElementCount > MAX_LINES) con.firstElementChild.remove();
+  while (con.childElementCount > MAX_LINES) {
+    const first = con.firstElementChild;
+    const cls = LEVELS.find((l) => first.classList.contains(l));
+    if (cls) ui.logCounts[cls]--;
+    first.remove();
+  }
+  renderLogCounts();
   if ($("#autoscroll").checked) con.scrollTop = con.scrollHeight;
 }
+
+function resetLog(lines) {
+  $("#console").replaceChildren();
+  ui.logCounts = {};
+  appendLog(lines);
+}
+
+function renderLogCounts() {
+  for (const chip of $$("#log-filters .chip")) chip.querySelector(".n").textContent = ui.logCounts[chip.dataset.level] || 0;
+}
+
+function applyLogFilters() {
+  const hidden = store("panel.logHidden") || [];
+  for (const chip of $$("#log-filters .chip")) {
+    const off = hidden.includes(chip.dataset.level);
+    chip.setAttribute("aria-pressed", String(!off));
+    $("#console").classList.toggle(`hide-${chip.dataset.level}`, off);
+  }
+}
+
+$$("#log-filters .chip").forEach((chip) => chip.addEventListener("click", () => {
+  const hidden = new Set(store("panel.logHidden") || []);
+  const level = chip.dataset.level;
+  if (hidden.has(level)) hidden.delete(level); else hidden.add(level);
+  store("panel.logHidden", [...hidden]);
+  applyLogFilters();
+}));
+
+$("#log-search").addEventListener("input", () => {
+  const q = logQuery();
+  for (const span of $("#console").children) {
+    span.classList.toggle("nomatch", !!q && !span.textContent.toLowerCase().includes(q));
+  }
+});
 
 function appendChat(entry) {
   const chat = $("#chat");
   chat.querySelector(".empty")?.remove();
-  chat.append(el("div", {}, el("time", { textContent: entry.time }), entry.text));
+  const m = entry.text.match(/^<(\w{1,16})> (.*)$/);
+  let row;
+  if (m) {
+    row = el("div", { className: "chat-line" }, avatar(m[1], true),
+      el("div", { className: "msg" },
+        el("span", { className: "who" }, el("b", { textContent: m[1] }), el("time", { textContent: entry.time })),
+        el("span", { className: "text", textContent: m[2] })));
+  } else {
+    row = el("div", { className: "chat-line event" },
+      el("span", { className: "text", textContent: entry.text }), el("time", { textContent: entry.time }));
+  }
+  chat.append(row);
   while (chat.childElementCount > 300) chat.firstElementChild.remove();
   chat.scrollTop = chat.scrollHeight;
+}
+
+function resetChat(entries) {
+  $("#chat").replaceChildren();
+  if (!entries.length) $("#chat").append(el("div", { className: "empty", textContent: "No chat messages yet" }));
+  entries.forEach(appendChat);
 }
 
 // ---------- status / stats ----------
 
 function renderStatus(s) {
   ui.status = s;
+  updateServerEntry(s);
   const pill = $("#state-pill");
   pill.textContent = s.state;
   pill.className = "pill " + s.state;
@@ -152,12 +519,12 @@ function renderStatus(s) {
   $("#eula-banner").classList.toggle("hidden", !s.eula_missing);
 
   // The public map runs on its own port (plain HTTP), same host as the panel
-  const mapUrl = s.map_port ? `http://${location.hostname}:${s.map_port}/` : null;
+  const mapUrl = s.map_port ? `http://${location.hostname}:${s.map_port}${s.map_path || "/"}` : null;
   for (const a of [$("#map-link"), $("#map-open")]) {
     a.classList.toggle("hidden", !mapUrl);
     if (mapUrl) a.href = mapUrl;
   }
-  $("#map-render").classList.toggle("hidden", !ui.settings?.map_enabled);
+  $("#map-render").classList.toggle("hidden", !ui.settings?.map_enabled || !ui.server?.has_map);
 
   const alive = s.state !== "stopped";
   const busy = !!s.task;
@@ -166,24 +533,75 @@ function renderStatus(s) {
   btn("stop").disabled = !alive || busy;
   btn("restart").disabled = !alive || busy;
   btn("backup").disabled = busy;
-  btn("kill").disabled = !alive;
-  btn("cancel").disabled = !busy || !["stop", "restart"].includes(s.task);
+  btn("kill").classList.toggle("hidden", !alive);
+  btn("cancel").classList.toggle("hidden", !["stop", "restart"].includes(s.task));
   $("#install-btn").disabled = busy;
 
   $("#player-count").textContent = s.players.length;
+  $("#nav-players").textContent = s.players.length || "";
+  $("#count-online").textContent = s.players.length;
+  $("#player-heads").replaceChildren(...s.players.map((n) => {
+    const b = el("button", { type: "button", className: "head-btn", title: `Profile of ${n}`, ariaLabel: `Profile of ${n}` }, avatar(n, true));
+    b.addEventListener("click", () => openProfile(n));
+    return b;
+  }));
   const list = $("#players");
   list.replaceChildren();
   if (!s.players.length) {
     list.append(el("li", { className: "empty", textContent: alive ? "Nobody online" : "Server offline" }));
   }
   for (const name of s.players) {
-    list.append(el("li", {}, el("span", { className: "avatar", textContent: name[0].toUpperCase() }),
-      el("span", { className: "grow", textContent: name }),
+    list.append(el("li", { className: lower(name) === lower(ui.profile?.name || "") ? "selected" : "" }, avatar(name),
+      el("div", { className: "grow" }, playerName(name),
+        el("div", { className: "meta", textContent: [onWhitelist(name) ? "whitelisted" : null, isOp(name) ? "operator" : null].filter(Boolean).join(" · ") || "online" })),
       playerActions(name)));
   }
+  if (ui.profile) renderProfileButtons();
   renderInstalled(); // running marker / delete buttons depend on status
   if (ui.datapacks) renderDatapacks(ui.datapacks);
   renderAccess();    // "recently rejected" comes with the status
+}
+
+function drawSpark(sel, values, max, points = SPARK_POINTS) {
+  const svg = $(sel);
+  const line = svg.querySelector("polyline"), area = svg.querySelector(".area");
+  if (values.length < 2) { line.setAttribute("points", ""); area.setAttribute("d", ""); return; }
+  const w = 240, h = 38, step = w / (points - 1), x0 = w - step * (values.length - 1);
+  const pts = values.map((v, i) => `${(x0 + i * step).toFixed(1)},${(h + 1 - Math.min(v / max, 1) * h).toFixed(1)}`);
+  line.setAttribute("points", pts.join(" "));
+  area.setAttribute("d", `M${x0.toFixed(1)},40 L${pts.join(" L")} L${w},40 Z`);
+}
+
+function pushSpark(key, value) {
+  const arr = ui.spark[key];
+  arr.push(value);
+  if (arr.length > SPARK_POINTS) arr.shift();
+}
+
+function renderStats(st) {
+  const mc = st.minecraft;
+  $("#s-mc-state").textContent = mc ? "% of the machine" : "offline";
+  $("#s-mc-cpu").textContent = mc ? `${mc.cpu.toFixed(1)} %` : "–";
+  // RAM against the configured -Xmx (the JVM may use a bit more than the heap)
+  $("#s-mc-ram").textContent = mc ? fmtMB(mc.ram) : "–";
+  $("#s-mc-ram-max").textContent = mc?.ram_max ? `of ${fmtMB(mc.ram_max)}` : "";
+  $("#b-mc-ram").style.width = mc?.ram_max ? `${Math.min((mc.ram / mc.ram_max) * 100, 100)}%` : "0";
+  if (mc) {
+    pushSpark("cpu", mc.cpu);
+    pushSpark("ram", mc.ram);
+  } else {
+    ui.spark = { cpu: [], ram: [] }; // stopped: no curve (a new process starts from zero)
+  }
+  drawSpark("#spark-cpu", ui.spark.cpu, Math.max(10, ...ui.spark.cpu) * 1.15);
+  drawSpark("#spark-ram", ui.spark.ram, mc?.ram_max || Math.max(1, ...ui.spark.ram));
+  const t = st.tick;
+  $("#s-tps").textContent = t?.tps != null ? t.tps.toFixed(1) : "–";
+  $("#s-tps").className = "stat-value" + (t?.tps != null && t.tps < 15 ? " bad" : t?.tps != null && t.tps < 19 ? " meh" : "");
+  $("#s-mspt").textContent = t?.mspt != null ? `${t.mspt.toFixed(1)} ms/tick` : mc ? "" : "offline";
+  $("#s-panel").textContent = `${st.panel.cpu.toFixed(1)} % · ${fmtMB(st.panel.ram)}`;
+  $("#net-row").classList.toggle("hidden", !st.net);
+  if (st.net) $("#s-net").textContent = `${st.net.up} / ${st.net.down} KB/s`;
+  if (ui.status) $("#uptime-label").textContent = fmtDuration(st.uptime);
 }
 
 // ---------- whitelist & operators ----------
@@ -191,8 +609,9 @@ function renderStatus(s) {
 const lower = (n) => n.toLowerCase();
 const onWhitelist = (n) => (ui.access?.whitelist || []).some((w) => lower(w) === lower(n));
 const isOp = (n) => (ui.access?.ops || []).some((o) => lower(o.name) === lower(n));
+const banOf = (n) => (ui.access?.bans || []).find((b) => lower(b.name) === lower(n));
 
-/** Quick toggles for a player row: whitelist + operator. */
+/** Quick toggles for a player row: whitelist + operator + kick. */
 function playerActions(name) {
   const wl = onWhitelist(name), op = isOp(name);
   const mk = (iconName, on, title, kind) => {
@@ -202,9 +621,9 @@ function playerActions(name) {
   };
   const kick = el("button", { className: "icon-btn small danger", title: `Kick ${name}`, ariaLabel: `Kick ${name}` }, icon("sign-out"));
   kick.addEventListener("click", async () => {
-    if (!confirm(`Kick ${name} from the server?`)) return;
+    if (!(await ask({ title: `Kick ${name}?`, text: "They can join again right away.", ok: "Kick", danger: true, iconName: "sign-out" }))) return;
     try {
-      await api("/api/command", { method: "POST", body: { command: `kick ${name}` } });
+      await api(S("/command"), { method: "POST", body: { command: `kick ${name}` } });
     } catch (err) {
       toast(err.message, true);
     }
@@ -214,15 +633,6 @@ function playerActions(name) {
     mk("crown-simple", op, op ? `Remove operator rights from ${name}` : `Make ${name} operator`, "ops"),
     kick);
 }
-
-$("#map-render").addEventListener("click", async () => {
-  try {
-    await api("/api/map/render", { method: "POST" });
-    toast(ui.status?.state === "running" ? "Saving the world, then updating the map…" : "Updating the map…");
-  } catch (err) {
-    toast(err.message, true);
-  }
-});
 
 function removeButton(title, onClick) {
   const b = el("button", { className: "icon-btn small danger", title, ariaLabel: title }, icon("x"));
@@ -234,16 +644,17 @@ function renderAccess() {
   const a = ui.access;
   if (!a) return;
   $("#wl-enabled").checked = a.whitelist_enabled;
+  $("#count-whitelist").textContent = a.whitelist.length;
+  $("#count-ops").textContent = a.ops.length;
 
   const wl = $("#whitelist");
   wl.replaceChildren();
   // Players the whitelist just turned away, with a one-click "add"
   for (const name of (ui.status?.rejected || []).filter((n) => !onWhitelist(n))) {
-    const add = el("button", { className: "icon-btn small on", title: `Add ${name} to whitelist`, ariaLabel: `Add ${name} to whitelist` }, icon("user-plus"));
+    const add = el("button", { className: "btn small", title: `Add ${name} to whitelist` }, icon("user-plus"), "Add");
     add.addEventListener("click", () => changeAccess("whitelist", "add", name));
-    wl.append(el("li", { className: "current" },
-      el("span", { className: "avatar", textContent: name[0].toUpperCase() }),
-      el("div", { className: "grow" }, el("div", { textContent: name }),
+    wl.append(el("li", { className: "current" }, avatar(name),
+      el("div", { className: "grow" }, el("div", { className: "title", textContent: name }),
         el("div", { className: "meta", textContent: "just tried to join — not whitelisted" })),
       add));
   }
@@ -251,9 +662,8 @@ function renderAccess() {
     wl.append(el("li", { className: "empty", textContent: "Nobody on the whitelist yet" }));
   }
   for (const name of a.whitelist) {
-    wl.append(el("li", {},
-      el("span", { className: "avatar", textContent: name[0].toUpperCase() }),
-      el("span", { className: "grow", textContent: name }),
+    wl.append(el("li", {}, avatar(name),
+      el("span", { className: "grow" }, playerName(name)),
       removeButton(`Remove ${name} from whitelist`, () => changeAccess("whitelist", "remove", name))));
   }
 
@@ -261,48 +671,90 @@ function renderAccess() {
   ops.replaceChildren();
   if (!a.ops.length) ops.append(el("li", { className: "empty", textContent: "No operators yet" }));
   for (const o of a.ops) {
-    ops.append(el("li", {},
-      el("span", { className: "avatar", textContent: o.name[0].toUpperCase() }),
-      el("div", { className: "grow" }, el("div", { textContent: o.name }),
+    ops.append(el("li", {}, avatar(o.name),
+      el("div", { className: "grow" }, playerName(o.name),
         el("div", { className: "meta", textContent: `permission level ${o.level}` })),
       removeButton(`Remove operator rights from ${o.name}`, () => changeAccess("ops", "remove", o.name))));
+  }
+
+  const bans = $("#bans");
+  bans.replaceChildren();
+  $("#count-bans").textContent = a.bans.length;
+  if (!a.bans.length) bans.append(el("li", { className: "empty", textContent: "Nobody is banned" }));
+  for (const b of a.bans) {
+    const meta = [b.reason, b.source ? `by ${b.source}` : null, b.created ? b.created.slice(0, 16) : null,
+                  b.expires && b.expires !== "forever" ? `until ${b.expires.slice(0, 16)}` : null].filter(Boolean).join(" · ");
+    const unban = el("button", { className: "btn small", title: `Unban ${b.name}` }, icon("check"), "Unban");
+    unban.addEventListener("click", () => changeAccess("bans", "remove", b.name));
+    bans.append(el("li", {}, avatar(b.name),
+      el("div", { className: "grow" }, playerName(b.name), el("div", { className: "meta", textContent: meta })),
+      unban));
   }
 }
 
 async function loadAccess() {
+  const sid = ui.sid;
   try {
-    ui.access = await api("/api/access");
+    const a = await api(S("/access"));
+    if (sid !== ui.sid) return;
+    ui.access = a;
     renderAccess();
     if (ui.status) renderStatus(ui.status); // refresh toggles in the online list
   } catch { /* shown elsewhere */ }
 }
 
-async function changeAccess(kind, action, name) {
-  if (kind === "ops" && action === "add" &&
-      !confirm(`Make ${name} an operator?\n\nOperators can use every command, including /stop and /op.`)) return;
+const isOnline = (n) => !!ui.status?.players.some((p) => lower(p) === lower(n));
+
+/** The question asked before a whitelist / operator / ban change. */
+function accessQuestion(kind, action, name) {
+  const add = action === "add";
+  switch (kind) {
+    case "whitelist": return add ? `Add ${name} to the whitelist?` : `Remove ${name} from the whitelist?`;
+    case "ops": return add ? `Make ${name} an operator?\n\nOperators can use every command, including /stop and /op.`
+                           : `Remove the operator rights of ${name}?`;
+    default: return add ? `Ban ${name}?${isOnline(name) ? "\nThey are kicked right away." : ""}` : `Unban ${name}?`;
+  }
+}
+
+/** Change whitelist / operators / bans after asking (`asked`: the caller already asked, e.g. the
+ *  ban reason prompt). */
+async function changeAccess(kind, action, name, reason = "", asked = false) {
+  if (!asked && !confirm(accessQuestion(kind, action, name))) return false;
   try {
-    const res = await api(`/api/access/${kind}`, { method: "POST", body: { action, name } });
+    const res = await api(S(`/access/${kind}`), { method: "POST", body: { action, name, reason } });
     ui.access = res;
     toast(res.message);
     renderAccess();
     if (ui.status) renderStatus(ui.status);
+    return true;
   } catch (err) {
     toast(err.message, true);
+    return false;
   }
 }
 
-document.querySelectorAll(".add-form").forEach((form) => form.addEventListener("submit", async (e) => {
+$$(".add-form").forEach((form) => form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const input = form.querySelector("input");
   const name = input.value.trim();
   if (!name) return;
-  await changeAccess(form.dataset.kind, "add", name);
-  if (ui.access && (form.dataset.kind === "ops" ? isOp(name) : onWhitelist(name))) input.value = "";
+  const kind = form.dataset.kind;
+  const reason = kind === "bans" ? $("#ban-reason").value.trim() : "";
+  if (await changeAccess(kind, "add", name, reason)) {
+    input.value = "";
+    if (kind === "bans") $("#ban-reason").value = "";
+  }
 }));
 
 $("#wl-enabled").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  if (!confirm(on ? "Turn the whitelist on?\nOnly players on the list can join then."
+                  : "Turn the whitelist off?\nEverybody can join then.")) {
+    e.target.checked = !on;
+    return;
+  }
   try {
-    ui.access = await api("/api/access/whitelist/enabled", { method: "POST", body: { enabled: e.target.checked } });
+    ui.access = await api(S("/access/whitelist/enabled"), { method: "POST", body: { enabled: e.target.checked } });
     toast(`Whitelist ${ui.access.whitelist_enabled ? "enabled" : "disabled"}`);
     renderAccess();
   } catch (err) {
@@ -311,9 +763,208 @@ $("#wl-enabled").addEventListener("change", async (e) => {
   }
 });
 
-document.querySelectorAll('input[name="ptab"]').forEach((r) => r.addEventListener("change", () => {
-  document.querySelectorAll(".players-card .tab-panel").forEach((p) => p.classList.toggle("hidden", p.dataset.tab !== r.value));
-  if (r.value !== "online") loadAccess();
+function showPlayerTab(tab) {
+  ui.ptab = tab;
+  for (const t of $$("[data-ptab]")) t.setAttribute("aria-selected", String(t.dataset.ptab === tab));
+  for (const p of $$(".players-card .tab-panel")) p.classList.toggle("hidden", p.dataset.tab !== tab);
+}
+$$("[data-ptab]").forEach((t) => t.addEventListener("click", () => {
+  showPlayerTab(t.dataset.ptab);
+  if (t.dataset.ptab !== "online") loadAccess();
+}));
+
+// ---------- server list icon ----------
+
+function showServerIcon() {
+  $("#server-icon-img").src = `${S("/icon")}?t=${Date.now()}`;
+}
+
+/** Any image -> 64×64 PNG (centre square, smooth scaling). */
+async function iconPng(file) {
+  const img = await createImageBitmap(file);
+  const side = Math.min(img.width, img.height);
+  const canvas = Object.assign(document.createElement("canvas"), { width: 64, height: 64 });
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 64, 64);
+  img.close();
+  return new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Could not convert the image"))), "image/png"));
+}
+
+$("#server-icon-file").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file || !confirm(`Use ${file.name} as the icon in the server list?\nIt replaces the current icon.`)) return;
+  try {
+    const res = await fetch(S("/icon"), { method: "PUT", body: await iconPng(file), credentials: "same-origin" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    toast(ui.status?.state === "stopped" ? "Server icon saved" : "Server icon saved: shows after a restart");
+    showServerIcon();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("#server-icon-reset").addEventListener("click", async () => {
+  if (!confirm("Use the panel logo as the icon in the server list again?")) return;
+  try {
+    await api(S("/icon"), { method: "DELETE" });
+    toast("Server icon reset to the panel logo");
+    showServerIcon();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// ---------- player profile ----------
+
+const profilePanel = $("#profile-panel");
+
+/** Back to the hint in the profile card (nobody selected). */
+function closeProfile() {
+  ui.profile = null;
+  $("#pf-body").classList.add("hidden");
+  $("#pf-empty").classList.remove("hidden");
+  if (ui.status) renderStatus(ui.status); // selection mark in the list
+}
+profilePanel.querySelector("[data-pf-close]").addEventListener("click", closeProfile);
+
+function fmtAgo(ts) {
+  if (!ts) return null;
+  const sec = Math.max(0, Date.now() / 1000 - ts);
+  if (sec < 90) return "just now";
+  if (sec < 3600) return `${Math.round(sec / 60)} min ago`;
+  if (sec < 86400 * 2) return `${Math.round(sec / 3600)} h ago`;
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+function fmtPlayTime(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return h ? `${h} h ${m} min` : `${m} min`;
+}
+
+const DIM_NAME = { "minecraft:overworld": "Overworld", "minecraft:the_nether": "Nether", "minecraft:the_end": "End" };
+
+async function openProfile(name) {
+  ui.profile = { name };
+  $("#pf-name").textContent = name;
+  $("#pf-sub").textContent = "Loading…";
+  $("#pf-head").replaceWith(Object.assign(avatar(name, false, true), { id: "pf-head" }));
+  $("#pf-facts").replaceChildren();
+  $("#pf-empty").classList.add("hidden");
+  $("#pf-body").classList.remove("hidden");
+  renderProfileButtons();
+  if (ui.page !== "players") go(ui.sid, "players");
+  if (ui.status) renderStatus(ui.status); // selection mark in the list
+  if (innerWidth <= 1100) profilePanel.scrollIntoView({ behavior: "smooth", block: "start" });
+  const sid = ui.sid;
+  try {
+    const p = await api(S(`/players/${encodeURIComponent(name)}`));
+    if (sid !== ui.sid || ui.profile?.name !== name) return;
+    ui.profile = p;
+    renderProfile();
+  } catch (err) {
+    $("#pf-sub").textContent = err.message;
+  }
+}
+
+function renderProfile() {
+  const p = ui.profile;
+  $("#pf-name").textContent = p.name;
+  $("#pf-sub").textContent = [p.online ? "online now" : p.last_seen ? `last seen ${fmtAgo(p.last_seen)}` : "not seen by the panel yet",
+                              p.ban ? "banned" : null].filter(Boolean).join(" · ");
+  const facts = [];
+  const add = (label, value) => { if (value != null && value !== "") facts.push(el("div", {}, el("dt", { textContent: label }), el("dd", { textContent: value }))); };
+  add("Play time", p.stats ? fmtPlayTime(p.stats.play_time) : null);
+  add("First seen", p.first_seen ? new Date(p.first_seen * 1000).toLocaleString() : null);
+  add("Game mode", p.gamemode ? p.gamemode[0].toUpperCase() + p.gamemode.slice(1) : null);
+  add("Last position", p.pos ? `${p.pos.map(Math.round).join(" / ")} · ${DIM_NAME[p.dimension] || p.dimension || ""}` : null);
+  add("Health · level", p.health != null ? `${p.health / 2} ♥ · level ${p.level ?? 0}` : null);
+  add("Deaths · mob kills", p.stats ? `${p.stats.deaths} · ${p.stats.mob_kills}` : null);
+  add("Walked, flown, swum", p.stats ? `${p.stats.distance_km} km` : null);
+  add("Ban", p.ban ? [p.ban.reason, p.ban.source ? `by ${p.ban.source}` : null].filter(Boolean).join(" · ") : null);
+  add("UUID", p.uuid);
+  $("#pf-facts").replaceChildren(...facts);
+  for (const r of $$('input[name="pf-gm"]')) r.checked = r.value === p.gamemode;
+  renderProfileButtons();
+}
+
+function renderProfileButtons() {
+  const p = ui.profile;
+  if (!p) return;
+  const online = ui.status?.players.some((n) => lower(n) === lower(p.name));
+  $("#pf-live").classList.toggle("hidden", !online);
+  $("#pf-offline").classList.toggle("hidden", !!online);
+  const btn = (k) => profilePanel.querySelector(`[data-pf="${k}"]`);
+  const wl = onWhitelist(p.name), op = isOp(p.name), ban = banOf(p.name) || p.ban;
+  btn("whitelist").replaceChildren(icon("list-checks"), wl ? "Remove from whitelist" : "Add to whitelist");
+  btn("op").replaceChildren(icon("crown-simple"), op ? "Remove operator" : "Make operator");
+  btn("ban").replaceChildren(icon("prohibit"), ban ? "Unban" : "Ban…");
+  btn("ban").classList.toggle("danger", !ban);
+}
+
+/** The question asked before an action on an online player (kick asks for a reason instead). */
+const cap = (s) => s ? s[0].toUpperCase() + s.slice(1) : s;
+const PLAYER_QUESTIONS = {
+  gamemode: (n, v) => ({
+    title: `${cap(v)} mode for ${n}?`,
+    text: ui.profile?.gamemode ? `${cap(ui.profile.gamemode)} → ${cap(v)}` : "",
+    ok: `Switch to ${cap(v)}`,
+  }),
+  spawn: (n) => ({ title: `Teleport ${n} to the world spawn?`, ok: "Teleport", iconName: "house" }),
+  heal: (n) => ({ title: `Heal ${n}?`, text: "Full health and food.", ok: "Heal", iconName: "heart" }),
+  clear: (n) => ({ title: `Clear the inventory of ${n}?`, text: "All items are gone for good.", ok: "Clear inventory", danger: true, iconName: "trash" }),
+};
+
+async function playerAction(action, value = "", asked = false) {
+  const name = ui.profile?.name;
+  const question = PLAYER_QUESTIONS[action];
+  if (!asked && question && !(await ask(question(name, value)))) return false;
+  try {
+    const res = await api(S(`/players/${encodeURIComponent(name)}/action`), { method: "POST", body: { action, value } });
+    toast(res.message);
+    return true;
+  } catch (err) {
+    toast(err.message, true);
+    return false;
+  }
+}
+
+$$('input[name="pf-gm"]').forEach((r) => r.addEventListener("change", async () => {
+  if (await playerAction("gamemode", r.value)) {
+    if (ui.profile) ui.profile.gamemode = r.value;
+  } else {
+    for (const x of $$('input[name="pf-gm"]')) x.checked = x.value === ui.profile?.gamemode; // cancelled: back
+  }
+}));
+
+profilePanel.querySelectorAll("[data-pf]").forEach((b) => b.addEventListener("click", async () => {
+  const name = ui.profile?.name;
+  if (!name) return;
+  switch (b.dataset.pf) {
+    case "spawn": return playerAction("spawn");
+    case "heal": return playerAction("heal");
+    case "clear": return playerAction("clear");
+    case "kick": {
+      const reason = prompt(`Kick ${name}? Optional reason:`, "");
+      if (reason !== null) playerAction("kick", reason, true);
+      return;
+    }
+    case "whitelist": await changeAccess("whitelist", onWhitelist(name) ? "remove" : "add", name); break;
+    case "op": await changeAccess("ops", isOp(name) ? "remove" : "add", name); break;
+    case "ban": {
+      if (banOf(name) || ui.profile.ban) {
+        await changeAccess("bans", "remove", name);
+      } else {
+        const reason = prompt(`Ban ${name}?${isOnline(name) ? " They are kicked right away." : ""} Optional reason:`, "");
+        if (reason === null) return;
+        await changeAccess("bans", "add", name, reason, true);
+      }
+      break;
+    }
+  }
+  if (ui.profile) openProfile(name);
 }));
 
 // ---------- data packs ----------
@@ -332,30 +983,30 @@ function renderDatapacks(d) {
   ui.datapacks = d;
   const ul = $("#datapacks");
   ul.replaceChildren();
-  if (d.experiments?.enabled.length) {
-    ul.append(el("li", { className: "current", title: "Built-in experimental packs, chosen when the world was created" },
-      tag("experiments", "warn"),
-      el("div", { className: "grow meta", textContent: d.experiments.enabled.join(", ") })));
-  }
+  $("#addon-note").textContent = d.experiments?.enabled.length
+    ? `Experiments in this world: ${d.experiments.enabled.join(", ")} (chosen when the world was created).`
+    : "";
   if (!d.packs.length) {
-    ul.append(el("li", { className: "empty", textContent: "No data packs — add a .zip" }));
+    ul.append(el("li", { className: "empty", textContent: "No data packs yet — upload a .zip" }));
     return;
   }
   const alive = ui.status && ui.status.state !== "stopped";
   for (const p of d.packs) {
     const label = p.name.replace(/\.zip$/i, "");
-    let toggle = null;
-    if (p.installed) {
-      const box = el("input", { type: "checkbox", checked: p.status !== "disabled", disabled: !p.valid });
-      box.addEventListener("change", () => toggleDatapack(p, box));
-      toggle = el("label", { className: "check", title: p.status !== "disabled" ? "Disable in this world" : "Enable in this world" },
-        box, el("span", { className: "box" }, icon("check")));
-    }
-    const meta = [PACK_STATUS[p.status], p.in_library ? null : "only in this world", p.description, `${p.size_kb} KB`]
-      .filter(Boolean).join(" · ");
-    ul.append(el("li", { className: p.installed ? "" : "inactive", title: p.description },
-      toggle,
-      el("div", { className: "grow" }, el("div", { textContent: label }), el("div", { className: "meta", textContent: meta })),
+    const toggle = p.installed
+      ? switchInput(p.status !== "disabled", p.status !== "disabled" ? `Disable ${label} in this world` : `Enable ${label} in this world`,
+          (input) => toggleDatapack(p, input), !p.valid)
+      : null;
+    const meta = [PACK_STATUS[p.status], p.in_library ? null : "only in this world", `${p.size_kb} KB`].filter(Boolean).join(" · ");
+    const iconBox = el("span", { className: "pack-icon", textContent: label[0]?.toUpperCase() || "?" });
+    iconBox.style.background = nameColor(label);
+    iconBox.setAttribute("aria-hidden", "true");
+    ul.append(el("li", { className: p.installed ? "" : "inactive" },
+      iconBox,
+      el("div", { className: "grow" },
+        el("div", { className: "title", textContent: label }),
+        p.description ? el("div", { className: "meta", textContent: p.description }) : null,
+        el("div", { className: "meta", textContent: meta })),
       p.valid ? null : tag("no pack.mcmeta", "warn", "warning"),
       p.outdated ? tag("update", "info") : null,
       el("span", { className: "row-actions" },
@@ -369,13 +1020,16 @@ function renderDatapacks(d) {
           ? packButton("x", alive ? "Stop the server to remove it from the world" : `Remove ${label} from this world`,
               () => removeDatapack(p), { danger: true, disabled: alive })
           : null,
-        p.in_library ? packButton("trash", `Delete ${label} from the library`, () => deleteDatapack(p), { danger: true }) : null)));
+        p.in_library ? packButton("trash", `Delete ${label} from the library`, () => deleteDatapack(p), { danger: true }) : null),
+      toggle));
   }
 }
 
 async function loadDatapacks() {
+  const sid = ui.sid;
   try {
-    renderDatapacks(await api("/api/datapacks"));
+    const d = await api(S("/datapacks"));
+    if (sid === ui.sid) renderDatapacks(d);
   } catch (err) {
     toast(err.message, true);
   }
@@ -383,22 +1037,22 @@ async function loadDatapacks() {
 
 async function packAction(p, action, method, done) {
   try {
-    renderDatapacks(await api(`/api/datapacks/${encodeURIComponent(p.name)}/${action}`, { method }));
+    renderDatapacks(await api(S(`/datapacks/${encodeURIComponent(p.name)}/${action}`), { method }));
     toast(`${p.name} ${done}`);
   } catch (err) {
     toast(err.message, true);
   }
 }
 
-async function toggleDatapack(p, box) {
-  const enabled = box.checked;
-  box.disabled = true;
+async function toggleDatapack(p, input) {
+  const enabled = input.checked;
+  input.disabled = true;
   try {
-    renderDatapacks(await api(`/api/datapacks/${encodeURIComponent(p.name)}/enabled`, { method: "POST", body: { enabled } }));
+    renderDatapacks(await api(S(`/datapacks/${encodeURIComponent(p.name)}/enabled`), { method: "POST", body: { enabled } }));
     toast(`${p.name} ${enabled ? "enabled" : "disabled"}`);
   } catch (err) {
-    box.checked = !enabled;
-    box.disabled = false;
+    input.checked = !enabled;
+    input.disabled = false;
     toast(err.message, true);
   }
 }
@@ -410,16 +1064,15 @@ function removeDatapack(p) {
 
 function deleteDatapack(p) {
   const note = p.installed ? "The copy in the current world stays." : "";
-  if (confirm(`Delete ${p.name} from the library?\n${note}`)) packAction(p, "library", "DELETE", "deleted from the library");
+  if (confirm(`Delete ${p.name} from the library (all servers)?\n${note}`)) packAction(p, "library", "DELETE", "deleted from the library");
 }
 
-$("#datapack-file").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  e.target.value = "";
+async function uploadDatapack(file) {
   if (!file) return;
+  if (!/\.zip$/i.test(file.name)) return toast("Upload a .zip file", true);
   toast(`Uploading ${file.name}…`);
   try {
-    const res = await fetch(`/api/datapacks/upload?name=${encodeURIComponent(file.name)}`, {
+    const res = await fetch(S(`/datapacks/upload?name=${encodeURIComponent(file.name)}`), {
       method: "POST", body: file, headers: { "Content-Type": "application/zip" }, credentials: "same-origin",
     });
     if (res.status === 401) return showLogin();
@@ -430,23 +1083,357 @@ $("#datapack-file").addEventListener("change", async (e) => {
   } catch (err) {
     toast(err.message, true);
   }
-});
-
-function renderStats(st) {
-  const mc = st.minecraft;
-  $("#s-mc-state").textContent = mc ? "" : "· offline";
-  $("#s-mc-cpu").textContent = mc ? `${mc.cpu.toFixed(1)} %` : "–";
-  $("#b-mc-cpu").style.width = mc ? `${Math.min(mc.cpu, 100)}%` : "0";
-  // RAM against the configured -Xmx (the JVM may use a bit more than the heap)
-  $("#s-mc-ram").textContent = mc ? (mc.ram_max ? `${fmtMB(mc.ram)} / ${fmtMB(mc.ram_max)}` : fmtMB(mc.ram)) : "–";
-  $("#b-mc-ram").style.width = mc?.ram_max ? `${Math.min((mc.ram / mc.ram_max) * 100, 100)}%` : "0";
-  $("#s-panel").textContent = `${st.panel.cpu.toFixed(1)} % · ${fmtMB(st.panel.ram)}`;
-  $("#net-row").classList.toggle("hidden", !st.net);
-  if (st.net) $("#s-net").textContent = `${st.net.up} / ${st.net.down} KB/s`;
-  if (ui.status) $("#uptime-label").textContent = fmtDuration(st.uptime);
 }
 
-// ---------- backups ----------
+$("#datapack-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  uploadDatapack(file);
+});
+/** Drag & drop onto a .dropzone label: hand the file to the upload function of its input. */
+function dropTarget(zone, upload) {
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("over"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("over"));
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    zone.classList.remove("over");
+    upload(e.dataTransfer.files[0]);
+  });
+}
+dropTarget($('.dropzone[for="datapack-file"]'), uploadDatapack);
+
+// ---------- mods (Fabric) & plugins (Paper) ----------
+
+const KIND_LABEL = { mods: ["Mods", "mod"], plugins: ["Plugins", "plugin"] };
+
+function showAddonTab(tab) {
+  ui.atab = tab;
+  store("panel.addonTab", tab);
+  for (const t of $$("[data-atab]")) t.setAttribute("aria-selected", String(t.dataset.atab === tab));
+  $("#datapacks-panel").classList.toggle("hidden", tab !== "datapacks");
+  $("#jars-panel").classList.toggle("hidden", tab !== "jars");
+  if (tab !== "jars") return;
+  // Show what we already have at once; before the first answer show nothing rather than a
+  // placeholder layout that jumps (empty list ↔ Vanilla note) when the data arrives
+  if (ui.addons) renderAddons(ui.addons);
+  else for (const id of ["#vanilla-note", "#jars-content"]) $(id).classList.add("hidden");
+  loadAddons();
+}
+$$("[data-atab]").forEach((t) => t.addEventListener("click", () => showAddonTab(t.dataset.atab)));
+$$("[data-goto]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); go(ui.sid, a.dataset.goto); }));
+
+/** Tab label follows the server type (Mods for Fabric, Plugins for Paper). */
+function renderAddonTabLabel() {
+  const kind = { fabric: "mods", paper: "plugins" }[ui.settings?.flavor];
+  $("#jars-tab-label").textContent = kind ? KIND_LABEL[kind][0] : "Mods & plugins";
+}
+
+function renderAddons(d) {
+  ui.addons = d;
+  const vanilla = !d.kind;
+  $("#vanilla-note").classList.toggle("hidden", !vanilla);
+  $("#jars-content").classList.toggle("hidden", vanilla);
+  $("#count-jars").textContent = d.items.length || "";
+  if (vanilla) return;
+  const [Title, one] = KIND_LABEL[d.kind];
+  $("#jars-title").textContent = `${Title} on this server`;
+  $("#jars-note").textContent = d.running ? "changes apply after a restart" : "";
+  $("#jar-drop-note").textContent = `${one} .jar from another source`;
+  $("#mr-note").textContent = d.version ? `${d.kind === "mods" ? "Fabric" : "Paper"} ${d.version}, only server-compatible projects`
+    : "Choose a Minecraft version first";
+  const ul = $("#jars");
+  ul.replaceChildren();
+  if (!d.items.length) {
+    ul.append(el("li", { className: "empty", textContent: `No ${Title.toLowerCase()} yet — search Modrinth or upload a .jar` }));
+    return;
+  }
+  const updates = ui.addonUpdates || {};
+  for (const a of d.items) {
+    const upd = updates[a.file];
+    const meta = [a.version, a.authors.length ? `by ${a.authors.join(", ")}` : null, `${a.size_kb} KB`].filter(Boolean).join(" · ");
+    const iconBox = el("span", { className: "pack-icon", textContent: a.name[0]?.toUpperCase() || "?" });
+    iconBox.style.background = nameColor(a.name);
+    iconBox.setAttribute("aria-hidden", "true");
+    const tags = [];
+    if (a.side === "both") tags.push(tag("players need it too", "violet", "users"));
+    else if (a.side === "server") tags.push(tag("server only", "accent"));
+    else if (a.side === "client") tags.push(tag("client only", "warn", "warning"));
+    for (const p of a.problems) tags.push(tag(p, "danger", "warning"));
+    if (a.missing.length) tags.push(tag(`needs ${a.missing.join(", ")}`, "danger", "warning"));
+    if (a.incompatible) tags.push(tag(a.incompatible, "warn", "warning"));
+    if (upd) tags.push(tag(`update: ${upd.version}`, "info"));
+    const del = packButton("trash", `Delete ${a.name}`, () => deleteAddon(a), { danger: true });
+    const updBtn = upd ? packButton("download-simple", `Update ${a.name} to ${upd.version}`, () => updateAddon(a)) : null;
+    ul.append(el("li", { className: a.enabled ? "" : "inactive" },
+      iconBox,
+      el("div", { className: "grow" },
+        el("div", { className: "title", textContent: a.name }),
+        a.description ? el("div", { className: "meta", textContent: a.description }) : null,
+        el("div", { className: "meta", textContent: meta }),
+        tags.length ? el("div", { className: "tag-row" }, ...tags) : null),
+      el("span", { className: "row-actions" }, updBtn, del),
+      switchInput(a.enabled, a.enabled ? `Disable ${a.name}` : `Enable ${a.name}`, (input) => toggleAddon(a, input))));
+  }
+}
+
+async function loadAddons() {
+  const sid = ui.sid;
+  try {
+    const d = await api(S("/addons"));
+    if (sid !== ui.sid) return;
+    renderAddons(d);
+    // First visit: show popular projects for this version
+    if (d.kind && d.version && !$("#mr-results").childElementCount) searchModrinth();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function addonAction(path, method, done, body) {
+  try {
+    renderAddons(await api(S(path), { method, body }));
+    toast(done);
+  } catch (err) {
+    toast(err.message, true);
+    loadAddons();
+  }
+}
+
+const toggleAddon = (a, input) => {
+  input.disabled = true;
+  addonAction(`/addons/${encodeURIComponent(a.file)}/enabled`, "POST", `${a.name} ${input.checked ? "enabled" : "disabled"}`, { enabled: input.checked });
+};
+
+function deleteAddon(a) {
+  if (confirm(`Delete ${a.name} (${a.file}) from this server?`)) addonAction(`/addons/${encodeURIComponent(a.file)}`, "DELETE", `${a.name} deleted`);
+}
+
+async function updateAddon(a) {
+  toast(`Updating ${a.name}…`);
+  await addonAction(`/addons/${encodeURIComponent(a.file)}/update`, "POST", `${a.name} updated`);
+  if (ui.addonUpdates) delete ui.addonUpdates[a.file];
+  if (ui.addons) renderAddons(ui.addons);
+}
+
+$("#jars-updates").addEventListener("click", async () => {
+  const btn = $("#jars-updates");
+  btn.disabled = true;
+  try {
+    ui.addonUpdates = await api(S("/addons/updates"));
+    const n = Object.keys(ui.addonUpdates).length;
+    toast(n ? `${n} update${n > 1 ? "s" : ""} available` : "Everything from Modrinth is up to date");
+    if (ui.addons) renderAddons(ui.addons);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function fmtCount(n) {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : n >= 1e3 ? `${Math.round(n / 1e3)} k` : String(n);
+}
+
+async function searchModrinth() {
+  const sid = ui.sid;
+  const ul = $("#mr-results");
+  ul.replaceChildren(el("li", { className: "empty", textContent: "Searching…" }));
+  try {
+    const res = await api(S(`/addons/search?q=${encodeURIComponent($("#mr-query").value)}`));
+    if (sid !== ui.sid) return;
+    ul.replaceChildren();
+    if (!res.hits.length) ul.append(el("li", { className: "empty", textContent: "Nothing found for this version" }));
+    for (const h of res.hits) {
+      const img = h.icon_url
+        ? el("img", { className: "pack-icon", src: h.icon_url, alt: "", loading: "lazy", referrerPolicy: "no-referrer" })
+        : el("span", { className: "pack-icon", textContent: h.title[0]?.toUpperCase() || "?" });
+      const add = el("button", { className: "btn small", title: `Install ${h.title} and its required dependencies` }, icon("download-simple"), "Install");
+      add.addEventListener("click", async () => {
+        add.disabled = true;
+        toast(`Installing ${h.title}…`);
+        try {
+          const d = await api(S("/addons/install"), { method: "POST", body: { project_id: h.project_id } });
+          renderAddons(d);
+          toast(d.installed.length ? `Installed: ${d.installed.join(", ")}` : `${h.title} is already installed`);
+        } catch (err) {
+          toast(err.message, true);
+        } finally {
+          add.disabled = false;
+        }
+      });
+      const side = h.client_side === "required" && ui.addons?.kind === "mods" ? " · players need it too" : "";
+      ul.append(el("li", {}, img,
+        el("div", { className: "grow" },
+          el("a", { className: "title", href: `https://modrinth.com/project/${encodeURIComponent(h.slug)}`, target: "_blank", rel: "noopener", textContent: h.title }),
+          el("div", { className: "meta clamp", textContent: h.description }),
+          el("div", { className: "meta", textContent: `${fmtCount(h.downloads)} downloads${side}` })),
+        add));
+    }
+  } catch (err) {
+    ul.replaceChildren();
+    toast(err.message, true);
+  }
+}
+
+$("#mr-form").addEventListener("submit", (e) => { e.preventDefault(); searchModrinth(); });
+
+async function uploadJar(file) {
+  if (!file) return;
+  if (!/\.jar$/i.test(file.name)) return toast("Upload a .jar file", true);
+  toast(`Uploading ${file.name}…`);
+  try {
+    const res = await fetch(S(`/addons/upload?name=${encodeURIComponent(file.name)}`), {
+      method: "POST", body: file, headers: { "Content-Type": "application/java-archive" }, credentials: "same-origin",
+    });
+    if (res.status === 401) return showLogin();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    renderAddons(data);
+    toast(`${file.name} added`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+$("#jar-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  uploadJar(file);
+});
+dropTarget($('.dropzone[for="jar-file"]'), uploadJar);
+
+// ---------- resource history (last hour) ----------
+
+async function loadHistory() {
+  const sid = ui.sid;
+  try {
+    const h = await api(S("/history"));
+    if (sid !== ui.sid) return;
+    const pts = h.points;
+    const n = Math.round(3600 / h.interval);
+    $("#history-card").classList.toggle("hidden", pts.length < 2);
+    if (pts.length < 2) return;
+    const col = (k) => pts.map((p) => p[k]);
+    const cpu = col("cpu"), ram = col("ram"), players = col("players");
+    const tps = pts.map((p) => p.tps ?? 20);
+    drawSpark("#hist-cpu", cpu, Math.max(10, ...cpu) * 1.15, n);
+    drawSpark("#hist-ram", ram, Math.max(...ram) * 1.1, n);
+    drawSpark("#hist-players", players, Math.max(1, ...players) * 1.15, n);
+    drawSpark("#hist-tps", tps, 20, n);
+    $("#h-cpu").textContent = `max ${Math.max(...cpu).toFixed(1)} %`;
+    $("#h-ram").textContent = `max ${fmtMB(Math.max(...ram))}`;
+    $("#h-players").textContent = `max ${Math.max(...players)}`;
+    const measured = pts.filter((p) => p.tps != null).map((p) => p.tps);
+    $("#h-tps").textContent = measured.length ? `min ${Math.min(...measured).toFixed(1)}` : "not measured";
+  } catch { /* not important */ }
+}
+
+setInterval(() => {
+  if (ui.page === "overview" && ui.status?.state === "running" && !document.hidden && !$("#app").classList.contains("hidden")) loadHistory();
+}, 30000);
+
+// ---------- game rules ----------
+
+const rulesDialog = $("#rules-dialog");
+rulesDialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => rulesDialog.close()));
+
+function ruleRow(r) {
+  let control;
+  if (r.type === "bool") {
+    control = switchInput(r.value, r.command, (input) => setRule(r, input.checked, input));
+  } else {
+    const input = el("input", { type: "number", value: r.value, step: 1, className: "rule-num", ariaLabel: r.command });
+    input.addEventListener("change", () => setRule(r, Number(input.value), input));
+    control = input;
+  }
+  return el("div", { className: "rule", dataset: { search: `${r.command} ${r.label || ""}`.toLowerCase() } },
+    el("div", { className: "grow" },
+      el("div", { className: "title", textContent: r.label || r.command }),
+      r.label ? el("div", { className: "meta mono", textContent: r.command }) : null),
+    control);
+}
+
+function renderRules(d) {
+  const list = $("#rules-list");
+  const known = d.rules.filter((r) => r.label), rest = d.rules.filter((r) => !r.label);
+  list.replaceChildren(
+    known.length ? el("div", { className: "label", textContent: "Common" }) : null, ...known.map(ruleRow),
+    rest.length ? el("div", { className: "label", textContent: "All" }) : null, ...rest.map(ruleRow));
+  if (!d.world) list.replaceChildren(el("p", { className: "muted", textContent: "The world doesn't exist yet: start the server once." }));
+  $("#rules-note").textContent = d.live ? "Live from the running server: changes apply immediately."
+    : ui.status?.state === "stopped" ? "Server stopped: changes are written to the world and apply on the next start."
+    : "Values as of the last world save.";
+  filterRules();
+}
+
+function filterRules() {
+  const q = $("#rules-search").value.trim().toLowerCase();
+  for (const row of $$("#rules-list .rule")) row.classList.toggle("hidden", !!q && !row.dataset.search.includes(q));
+  for (const lbl of $$("#rules-list > .label")) lbl.classList.toggle("hidden", !!q);
+}
+$("#rules-search").addEventListener("input", filterRules);
+
+async function setRule(r, value, input) {
+  if (r.type === "int" && !Number.isInteger(value)) { toast("Enter a whole number", true); input.value = r.value; return; }
+  input.disabled = true;
+  try {
+    await api(S("/gamerules"), { method: "POST", body: { name: r.name, value } });
+    r.value = value;
+    toast(`${r.label || r.command}: ${typeof value === "boolean" ? (value ? "on" : "off") : value}`);
+  } catch (err) {
+    if (r.type === "bool") input.checked = r.value; else input.value = r.value;
+    toast(err.message, true);
+  } finally {
+    input.disabled = false;
+  }
+}
+
+$("#rules-btn").addEventListener("click", async () => {
+  $("#rules-search").value = "";
+  $("#rules-list").replaceChildren(el("p", { className: "muted", textContent: "Loading…" }));
+  $("#rules-note").textContent = "";
+  rulesDialog.showModal();
+  try {
+    renderRules(await api(S("/gamerules")));
+  } catch (err) {
+    $("#rules-list").replaceChildren(el("p", { className: "error", textContent: err.message }));
+  }
+});
+
+// ---------- world upload ----------
+
+function uploadWorld(file) {
+  if (!file) return;
+  if (!/\.zip$/i.test(file.name)) return toast("Upload the world as a .zip file", true);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", S("/backups/upload"));
+  xhr.setRequestHeader("Content-Type", "application/zip");
+  let last = 0;
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable || Date.now() - last < 700) return;
+    last = Date.now();
+    toast(`Uploading ${file.name}… ${Math.round((e.loaded / e.total) * 100)} %`);
+  };
+  xhr.onload = () => {
+    if (xhr.status === 401) return showLogin();
+    let data = {};
+    try { data = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+    if (xhr.status >= 300) return toast(data.detail || `HTTP ${xhr.status}`, true);
+    renderBackups(data.backups);
+    toast("World uploaded: it is in the list as a backup — press Restore to use it");
+  };
+  xhr.onerror = () => toast("Upload failed", true);
+  toast(`Uploading ${file.name}…`);
+  xhr.send(file);
+}
+
+$("#world-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  uploadWorld(file);
+});
+
+// ---------- backups & world ----------
 
 function renderBackups(list, keep, interval) {
   if (keep != null) {
@@ -457,19 +1444,18 @@ function renderBackups(list, keep, interval) {
   if (!list.length) ul.append(el("li", { className: "empty", textContent: "No backups yet" }));
   for (const b of list) {
     const link = el("a", {
-      className: "icon-btn small", href: `/api/backups/${encodeURIComponent(b.name)}`,
+      className: "icon-btn small", href: S(`/backups/${encodeURIComponent(b.name)}`),
       title: "Download", ariaLabel: `Download backup ${b.created}`,
     }, icon("download-simple"));
-    const restore = el("button", {
-      className: "icon-btn small", title: "Restore this backup", ariaLabel: `Restore backup ${b.created}`,
-    }, icon("clock-counter-clockwise"));
+    const restore = el("button", { className: "btn small", title: "Restore this backup" }, icon("clock-counter-clockwise"), "Restore");
     restore.addEventListener("click", () => restoreBackup(b));
-    const meta = `${b.size_mb} MB` + (b.note ? ` · ${b.note}` : "");
-    ul.append(el("li", { className: b.archive ? "current" : "" },
+    const kind = b.archive ? tag("Archive", "violet", "archive")
+      : b.note === "before restore" ? tag("Safety", "warn") : tag("Backup");
+    ul.append(el("li", {},
+      kind,
       el("div", { className: "grow" },
-        el("div", { textContent: b.created.replace("T", "  ") }),
-        el("div", { className: "meta", textContent: meta })),
-      b.archive ? tag("archive", "accent", "archive") : null,
+        el("div", { className: "title", textContent: b.created.replace("T", "  ") }),
+        el("div", { className: "meta", textContent: `${b.size_mb} MB` + (b.note ? ` · ${b.note}` : "") })),
       restore, link));
   }
 }
@@ -479,12 +1465,68 @@ async function restoreBackup(b) {
   if (!confirm(`Restore the backup from ${b.created.replace("T", " ")}?\n\n` +
                "The current world is replaced. It is saved as a new backup first, so you can go back.")) return;
   try {
-    await api(`/api/backups/${encodeURIComponent(b.name)}/restore`, { method: "POST" });
+    await api(S(`/backups/${encodeURIComponent(b.name)}/restore`), { method: "POST" });
     toast("Restoring…");
   } catch (err) {
     toast(err.message, true);
   }
 }
+
+$("#map-render").addEventListener("click", async () => {
+  try {
+    await api(S("/map/render"), { method: "POST" });
+    toast(ui.status?.state === "running" ? "Saving the world, then updating the map…" : "Updating the map…");
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+async function loadCaveReach() {
+  const form = $("#cave-form");
+  form.classList.toggle("hidden", !ui.server?.has_map);
+  if (!ui.server?.has_map) return;
+  try {
+    const v = await api("/api/map/visibility");
+    $("#cave-reach").value = v.cave_reach;
+    $("#all-caves").checked = !!v.all_caves;
+  } catch { form.classList.add("hidden"); }
+}
+
+async function saveVisibility(body) {
+  try {
+    const v = await api("/api/map/visibility", { method: "PUT", body });
+    $("#cave-reach").value = v.cave_reach;
+    $("#all-caves").checked = !!v.all_caves;
+    toast("Saved — the map is re-rendered");
+  } catch (err) {
+    toast(err.message, true);
+    loadCaveReach();
+  }
+}
+
+$("#cave-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  saveVisibility({ cave_reach: Number($("#cave-reach").value) });
+});
+$("#all-caves").addEventListener("change", (e) => {
+  if (e.target.checked && !confirm("Show all caves with the height cut?\n\nEverybody who opens the map can then see hidden caves (and bases in them).")) {
+    e.target.checked = false;
+    return;
+  }
+  saveVisibility({ all_caves: e.target.checked });
+});
+
+$("#map-enabled").addEventListener("change", async (e) => {
+  try {
+    await api(S("/settings"), { method: "POST", body: { map_enabled: e.target.checked } });
+    ui.settings.map_enabled = e.target.checked;
+    if (ui.status) renderStatus(ui.status);
+    toast(`Live map ${e.target.checked ? "on" : "off"}`);
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
 
 // ---------- downloaded servers ----------
 
@@ -499,25 +1541,25 @@ function renderInstalled() {
   for (const v of ui.installed) {
     const running = s.state !== "stopped" && s.flavor === v.flavor && s.version === v.version;
     const selected = ui.settings && ui.settings.flavor === v.flavor && ui.settings.version === v.version;
-    const meta = [v.build ? `build ${v.build}` : null, `${v.size_mb} MB`, v.java ? `Java ${v.java}` : null]
-      .filter(Boolean).join(" · ");
+    const build = v.build ? (v.flavor === "fabric" ? `loader ${v.build}` : `build ${v.build}`) : null;
+    const meta = [build, `${v.size_mb} MB`, v.java ? `Java ${v.java}` : null].filter(Boolean).join(" · ");
     const del = el("button", {
       className: "icon-btn small danger", title: running ? "Running — stop the server first" : "Delete",
       ariaLabel: `Delete ${flavorLabel(v.flavor, v.version)}`, disabled: running,
     }, icon("trash"));
     del.addEventListener("click", () => deleteInstalled(v));
     let upd = null;
-    if (v.flavor === "paper") {
+    if (v.flavor === "paper" || v.flavor === "fabric") {
       upd = el("button", {
-        className: "icon-btn small", title: "Check for a newer Paper build",
+        className: "icon-btn small", title: v.flavor === "paper" ? "Check for a newer Paper build" : "Check for a newer Fabric loader",
         ariaLabel: `Update ${flavorLabel(v.flavor, v.version)}`, disabled: !!s.task,
       }, icon("arrow-clockwise"));
       upd.addEventListener("click", () => updateInstalled(v));
     }
     ul.append(el("li", { className: selected ? "current" : "" },
-      tag(FLAVOR_NAME[v.flavor], v.flavor === "paper" ? "info" : ""),
+      tag(FLAVOR_NAME[v.flavor], { paper: "info", fabric: "violet" }[v.flavor] || ""),
       el("div", { className: "grow" },
-        el("div", { textContent: v.version }),
+        el("div", { className: "title", textContent: v.version }),
         el("div", { className: "meta", textContent: meta })),
       missingJava(v.flavor, v.version) ? tag(`needs Java ${v.java}`, "warn", "warning") : null,
       running ? tag("running", "accent") : selected ? tag("selected", "accent") : null,
@@ -527,8 +1569,8 @@ function renderInstalled() {
 
 async function updateInstalled(v) {
   try {
-    await api(`/api/versions/paper/${encodeURIComponent(v.version)}/update`, { method: "POST" });
-    toast(`Checking for a newer build of ${flavorLabel(v.flavor, v.version)}…`);
+    await api(S(`/versions/${v.flavor}/${encodeURIComponent(v.version)}/update`), { method: "POST" });
+    toast(`Checking for updates of ${flavorLabel(v.flavor, v.version)}…`);
   } catch (err) {
     toast(err.message, true);
   }
@@ -591,9 +1633,11 @@ function versionHints() {
     msgs.push(`Upgrade from ${w.version} to ${version}. The world is converted on first start; going back later needs a backup.`);
   }
   if (w?.flavor && w.flavor !== flavor) {
-    msgs.push(flavor === "paper"
-      ? "Switching to Paper: Paper moves the Nether and End into separate world folders automatically."
-      : "Switching to Vanilla: Paper keeps the Nether and End in separate folders, which Vanilla does not load without manual conversion.");
+    if (flavor === "paper") msgs.push("Switching to Paper: Paper moves the Nether and End into separate world folders automatically.");
+    else if (w.flavor === "paper") msgs.push(`Switching to ${FLAVOR_NAME[flavor]}: Paper keeps the Nether and End in separate folders, which ${FLAVOR_NAME[flavor]} does not load without manual conversion.`);
+    if (w.flavor === "fabric") msgs.push("Leaving Fabric: blocks and items from mods are removed when the world is loaded without them.");
+    if (flavor === "fabric") msgs.push("Fabric downloads the Minecraft server and its libraries on the first start. Install mods on the Add-ons page.");
+    msgs.push("A backup of the world is made automatically when you save.");
   }
   const java = missingJava(flavor, version);
   if (java) {
@@ -657,9 +1701,10 @@ function renderToggle() {
 
 async function loadVersions() {
   const { flavor } = ui.sel;
+  const sid = ui.sid;
   try {
     const data = await api(`/api/versions?flavor=${flavor}&snapshots=${$("#snapshots").checked}`);
-    if (flavor !== ui.sel.flavor) return; // flavor switched while loading
+    if (flavor !== ui.sel?.flavor || sid !== ui.sid) return; // switched while loading
     ui.versions = data.versions;
     ui.latest = data.latest;
   } catch (err) {
@@ -760,7 +1805,7 @@ const dd = (() => {
   return { isOpen, renderList };
 })();
 
-document.querySelectorAll('input[name="flavor"]').forEach((r) => r.addEventListener("change", () => {
+$$('input[name="flavor"]').forEach((r) => r.addEventListener("change", () => {
   ui.sel.flavor = r.value;
   ui.versions = [];
   renderToggle();
@@ -775,18 +1820,17 @@ document.querySelectorAll('input[name="flavor"]').forEach((r) => r.addEventListe
 }));
 $("#snapshots").addEventListener("change", loadVersions);
 
-/** True if the Server card differs from what is saved on the server. */
+/** True if the Server page differs from what is saved on the server. */
 function settingsDirty() {
   const s = ui.settings;
   if (!s || !ui.sel) return false;
   return ui.sel.flavor !== s.flavor
     || (ui.sel.version || "") !== (s.version || "")
     || $("#min-ram").value.trim().toUpperCase() !== s.min_ram
-    || $("#max-ram").value.trim().toUpperCase() !== s.max_ram
-    || $("#map-enabled").checked !== s.map_enabled;
+    || $("#max-ram").value.trim().toUpperCase() !== s.max_ram;
 }
 
-/** Save the Server card. Returns false if cancelled or failed. */
+/** Save the Server page. Returns false if cancelled or failed. */
 async function saveSettings() {
   const { flavor, version } = ui.sel;
   if (version && version !== ui.settings?.version && directionVsWorld(version) < 0 &&
@@ -795,14 +1839,14 @@ async function saveSettings() {
     return false;
   }
   try {
-    await api("/api/settings", {
+    await api(S("/settings"), {
       method: "POST",
-      body: {
-        flavor, version: version || "", min_ram: $("#min-ram").value, max_ram: $("#max-ram").value,
-        map_enabled: $("#map-enabled").checked,
-      },
+      body: { flavor, version: version || "", min_ram: $("#min-ram").value, max_ram: $("#max-ram").value },
     });
-    await loadState(false);
+    await Promise.all([loadState(false), loadServers()]);
+    // Type/version may have changed: mods vs. plugins, other search results
+    ui.addons = ui.addonUpdates = null;
+    $("#mr-results").replaceChildren();
     return true;
   } catch (err) {
     toast(err.message, true);
@@ -813,10 +1857,9 @@ async function saveSettings() {
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (await saveSettings()) {
-    toast("Settings saved" + (ui.status?.state !== "stopped" ? " — RAM and map changes apply after a restart" : ""));
+    toast("Settings saved" + (ui.status?.state !== "stopped" ? " — RAM changes apply after a restart" : ""));
   }
 });
-$("#map-enabled").addEventListener("change", () => renderHint());
 $("#min-ram").addEventListener("input", () => renderHint());
 $("#max-ram").addEventListener("input", () => renderHint());
 
@@ -824,7 +1867,7 @@ $("#install-btn").addEventListener("click", async () => {
   const { flavor, version } = ui.sel;
   if (!version) return toast("Choose a version first", true);
   try {
-    await api("/api/versions/install", { method: "POST", body: { flavor, version } });
+    await api(S("/versions/install"), { method: "POST", body: { flavor, version } });
     toast(`Downloading ${flavorLabel(flavor, version)}…`);
   } catch (err) {
     toast(err.message, true);
@@ -841,7 +1884,7 @@ function propInputs() {
 
 $("#props-btn").addEventListener("click", async () => {
   try {
-    const { values } = await api("/api/properties");
+    const { values } = await api(S("/properties"));
     for (const node of propInputs()) {
       const v = values[node.dataset.key];
       if (node.classList.contains("segmented")) {
@@ -878,7 +1921,7 @@ $("#props-form").addEventListener("submit", async (e) => {
     }
   }
   try {
-    await api("/api/properties", { method: "POST", body: values });
+    await api(S("/properties"), { method: "POST", body: values });
     propsDialog.close();
     toast("Game settings saved" + (ui.status?.state !== "stopped" ? " — restart to apply" : ""));
   } catch (err) {
@@ -894,20 +1937,12 @@ $("#new-world-btn").addEventListener("click", async () => {
   if (ui.status?.state !== "stopped") return toast("Stop the server before creating a new world", true);
   $("#world-seed").value = "";
   // Pack choice: everything known (library + current world), preselected = active in the current world
-  let packs = [], exp = { available: [], enabled: [] };
+  let packs = [];
   try {
-    const d = await api("/api/datapacks");
-    packs = d.packs.filter((p) => p.valid);
-    exp = d.experiments;
+    packs = (await api(S("/datapacks"))).packs.filter((p) => p.valid);
   } catch (err) {
     toast(err.message, true);
   }
-  // Experiments: unchecked by default, even if the old world had them
-  $("#world-exp-wrap").open = false;
-  $("#world-exp").replaceChildren(...exp.available.map((id) => el("label", { className: "check" },
-    el("input", { type: "checkbox", value: id }),
-    el("span", { className: "box" }, icon("check")),
-    el("span", { textContent: id + (exp.enabled.includes(id) ? " (on in the current world)" : "") }))));
   $("#world-packs-wrap").classList.toggle("hidden", !packs.length);
   $("#world-packs").replaceChildren(...packs.map((p) => el("label", { className: "check" },
     el("input", { type: "checkbox", value: p.name, checked: p.installed && p.status !== "disabled" }),
@@ -921,8 +1956,7 @@ $("#world-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
     const datapacks = [...$("#world-packs").querySelectorAll("input:checked")].map((i) => i.value);
-    const experiments = [...$("#world-exp").querySelectorAll("input:checked")].map((i) => i.value);
-    await api("/api/world/new", { method: "POST", body: { seed: $("#world-seed").value, datapacks, experiments } });
+    await api(S("/world/new"), { method: "POST", body: { seed: $("#world-seed").value, datapacks } });
     worldDialog.close();
     toast("Archiving the old world…");
   } catch (err) {
@@ -938,15 +1972,15 @@ const CONFIRM = {
   kill: "Force kill the server process? Unsaved world data may be lost.",
 };
 
-document.querySelectorAll("[data-action]").forEach((btn) => {
+$$("[data-action]").forEach((btn) => {
   btn.addEventListener("click", async () => {
     const action = btn.dataset.action;
-    if (CONFIRM[action] && !confirm(CONFIRM[action])) return;
-    // Start what is selected in the Server card, even if "Save" wasn't pressed
+    if (CONFIRM[action] && !confirm(`${ui.server?.name || "Server"}: ${CONFIRM[action]}`)) return;
+    // Start what is selected on the Server page, even if "Save" wasn't pressed
     if (action === "start" && settingsDirty() && !(await saveSettings())) return;
-    const countdown = Number(document.querySelector('input[name="countdown"]:checked').value);
+    const countdown = Number($("#countdown").value);
     const body = ["stop", "restart"].includes(action) ? { countdown } : undefined;
-    const path = action === "backup" ? "/api/backups" : `/api/${action}`;
+    const path = action === "backup" ? S("/backups") : S(`/${action}`);
     try {
       await api(path, { method: "POST", body });
     } catch (err) {
@@ -957,7 +1991,7 @@ document.querySelectorAll("[data-action]").forEach((btn) => {
 
 $("#eula-accept").addEventListener("click", async () => {
   try {
-    await api("/api/eula", { method: "POST" });
+    await api(S("/eula"), { method: "POST" });
     toast("EULA accepted — you can start the server now");
   } catch (err) {
     toast(err.message, true);
@@ -970,7 +2004,7 @@ $("#command-form").addEventListener("submit", async (e) => {
   const cmd = input.value.trim();
   if (!cmd) return;
   try {
-    await api("/api/command", { method: "POST", body: { command: cmd } });
+    await api(S("/command"), { method: "POST", body: { command: cmd } });
     if (ui.history[ui.history.length - 1] !== cmd) ui.history.push(cmd);
     ui.historyPos = ui.history.length;
     input.value = "";
@@ -992,7 +2026,7 @@ $("#say-form").addEventListener("submit", async (e) => {
   const msg = $("#say").value.trim();
   if (!msg) return;
   try {
-    await api("/api/command", { method: "POST", body: { command: `say ${msg}` } });
+    await api(S("/command"), { method: "POST", body: { command: `say ${msg}` } });
     $("#say").value = "";
   } catch (err) {
     toast(err.message, true);
@@ -1001,6 +2035,11 @@ $("#say-form").addEventListener("submit", async (e) => {
 
 // ---------- live connection ----------
 
+function setLive(on) {
+  $("#ws-indicator").classList.toggle("on", on);
+  $("#ws-text").textContent = on ? "Live" : "Reconnecting…";
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -1008,16 +2047,21 @@ function connect() {
 
   ws.onopen = () => {
     ui.wsRetry = 1000;
-    $("#ws-indicator").classList.add("on");
+    setLive(true);
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
+    if (msg.server && msg.server !== ui.sid) {
+      // Another server: only its state matters here (dot in the sidebar)
+      if (msg.type === "status") updateServerEntry(msg.status);
+      return;
+    }
     switch (msg.type) {
       case "log":
         appendLog([msg.line]);
-        if (/Backup saved|downloaded \(|updated to build|added to downloaded servers|restored\.$|New world prepared/.test(msg.line)) loadState(false);
+        if (/Backup saved|downloaded \(|updated to (build|loader)|added to downloaded servers|restored\.$|New world prepared/.test(msg.line)) loadState(false);
         // OP/whitelist changed via console or in-game: re-read once the server has written the file
-        if (/Made \w+ (a server operator|no longer a server operator)|(Added|Removed) \w+ (to|from) the whitelist|Whitelist is now turned (on|off)/i.test(msg.line)) {
+        if (/Made \w+ (a server operator|no longer a server operator)|(Added|Removed) \w+ (to|from) the whitelist|Whitelist is now turned (on|off)|Banned \w+|Unbanned \w+/i.test(msg.line)) {
           setTimeout(loadAccess, 600);
         }
         break;
@@ -1032,7 +2076,7 @@ function connect() {
     }
   };
   ws.onclose = (ev) => {
-    $("#ws-indicator").classList.remove("on");
+    setLive(false);
     if (ws !== ui.ws) return; // superseded or logged out
     if (ev.code === 4401) return showLogin();
     scheduleReconnect();
@@ -1043,6 +2087,7 @@ function scheduleReconnect() {
   setTimeout(async () => {
     if ($("#app").classList.contains("hidden")) return; // logged out meanwhile
     try {
+      await loadServers();
       await loadState(true); // resync everything missed while disconnected
       connect();
     } catch {
@@ -1053,43 +2098,53 @@ function scheduleReconnect() {
 }
 
 async function loadState(full) {
-  const data = await api("/api/state");
+  const sid = ui.sid;
+  const data = await api(S("/state"));
+  if (sid !== ui.sid) return; // switched to another server meanwhile
   const firstLoad = !ui.sel;
+  ui.server = data.server;
   ui.settings = data.settings;
   ui.world = data.world;
   ui.installed = data.installed;
   ui.java = Object.keys(data.java).map(Number);
   if (firstLoad) {
     ui.sel = { flavor: data.settings.flavor, version: data.settings.version || null };
-    document.querySelector(`input[name="flavor"][value="${ui.sel.flavor}"]`).checked = true;
+    const radio = document.querySelector(`input[name="flavor"][value="${ui.sel.flavor}"]`);
+    if (radio) radio.checked = true;
   }
+  renderServerInfo();
+  renderAddonTabLabel();
   renderStatus(data.status);
   renderBackups(data.backups, data.backup_keep, data.backup_interval);
+  $("#world-version").textContent = data.world.version
+    ? flavorLabel(data.world.flavor || data.settings.flavor, data.world.version) : "not started yet";
   const javas = Object.keys(data.java);
   $("#java-list").textContent = javas.length ? `Java ${javas.join(" · ")}` : "no Java found";
-  if (full) {
-    $("#console").replaceChildren();
-    appendLog(data.log);
-    $("#chat").replaceChildren();
-    if (!data.chat.length) $("#chat").append(el("div", { className: "empty", textContent: "No chat messages yet" }));
-    data.chat.forEach(appendChat);
+  if (full || firstLoad) {
+    resetLog(data.log);
+    resetChat(data.chat);
     $("#min-ram").value = data.settings.min_ram;
     $("#max-ram").value = data.settings.max_ram;
     $("#map-enabled").checked = data.settings.map_enabled;
+    loadAccess();
   }
-  if (full) loadAccess();
   loadDatapacks();
+  loadHistory();
   if (firstLoad || full) await loadVersions();
   else { renderToggle(); renderHint(); }
 }
 
 async function boot() {
-  await loadState(true);
+  await loadServers();
   $("#login").classList.add("hidden");
   $("#app").classList.remove("hidden");
-  connect();
+  ui.sid = null; // force a full load of the server in the URL
+  await route();
+  if (!ui.ws) connect();
 }
 
+applyLogFilters();
+showPlayerTab("online");
 boot().catch((err) => {
   // 401 already shows the login screen; anything else (panel unreachable) too, with the error
   if ($("#login").classList.contains("hidden")) {

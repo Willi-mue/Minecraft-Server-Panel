@@ -1,8 +1,8 @@
 """Runtime configuration.
 
 Static settings come from environment variables (see `.env.example`).
-Settings the user changes in the web UI (version, RAM) are persisted in
-`<DATA_DIR>/settings.json` and override the environment defaults.
+Settings the user changes in the web UI (version, RAM) are persisted per server in its
+`settings.json` (first server: `<DATA_DIR>/settings.json`) and override the environment defaults.
 """
 
 import json
@@ -40,6 +40,19 @@ BACKUP_KEEP = max(1, int(os.environ.get("BACKUP_KEEP", "7")))
 # Directory containing Java runtimes named by major version, e.g. /opt/java/21
 JAVA_DIR = Path(os.environ.get("JAVA_DIR", "/opt/java"))
 
+
+def _port_range(text: str) -> list[int]:
+    """"25565-25569" -> [25565, ..., 25569]; a single port is allowed too."""
+    lo, _, hi = text.strip().partition("-")
+    start, end = int(lo), int(hi or lo)
+    if not 1 <= start <= end <= 65535:
+        raise ValueError(f"Invalid SERVER_PORTS: {text}")
+    return list(range(start, end + 1))
+
+
+# Game ports for additional servers (the first server keeps the port in its server.properties)
+SERVER_PORTS = _port_range(os.environ.get("SERVER_PORTS") or "25565-25569")
+
 _RAM_RE = re.compile(r"^[1-9]\d*[MG]$")
 # Mojang version ids: "1.21.4", "26.4-snapshot-7", "1.14 Pre-Release 1", ... (no path separators)
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\- ]{0,63}$")
@@ -65,12 +78,19 @@ def ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
-def load_settings() -> Settings:
+def _settings_file(inst) -> Path:
+    # inst: instances.Instance (not imported here: instances imports config).
+    # None = the first server; only the live map still relies on that.
+    return SETTINGS_FILE if inst is None else inst.settings_file
+
+
+def load_settings(inst=None) -> Settings:
+    path = _settings_file(inst)
     with _lock:
         s = Settings()
-        if SETTINGS_FILE.exists():
+        if path.exists():
             try:
-                data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
                 for key, default in asdict(s).items():
                     if type(data.get(key)) is type(default):  # ignore wrong/missing types
                         setattr(s, key, data[key])
@@ -79,9 +99,11 @@ def load_settings() -> Settings:
         return s
 
 
-def save_settings(s: Settings) -> None:
+def save_settings(s: Settings, inst=None) -> None:
+    path = _settings_file(inst)
     with _lock:
-        SETTINGS_FILE.write_text(json.dumps(asdict(s), indent=2), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(asdict(s), indent=2), encoding="utf-8")
 
 
 def validate_ram(value: str) -> str:

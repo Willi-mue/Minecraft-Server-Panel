@@ -17,7 +17,7 @@ use serde_json::Value;
 pub const TEX: usize = 16;
 const ATLAS_COLS: usize = 32;
 /// Bump when the tables change shape: forces a rebuild (and a re-render of all tiles).
-const FORMAT: &str = "v6";
+const FORMAT: &str = "v8";
 
 /// How the viewer draws a block.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -34,6 +34,8 @@ pub enum Kind {
     Vine,
     /// a horizontal plane just above the block below (rails, lily pads, redstone)
     Flat,
+    /// small boxes from the block model (fences, doors, torches …; not solid): see `shape`
+    Parts,
 }
 
 /// Tint applies to: top, side, bottom (the side overlay is always tinted).
@@ -41,9 +43,10 @@ pub const TINT_TOP: u8 = 1;
 pub const TINT_SIDE: u8 = 2;
 pub const TINT_BOTTOM: u8 = 4;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Tint {
+    #[default]
     None,
     Grass,
     Foliage,
@@ -57,22 +60,27 @@ pub struct Block {
     pub name: String,
     pub kind: Kind,
     /// a box, seen from above in 2D (plants, rails, torches … are looked through)
+    #[serde(default, skip_serializing_if = "is_false")]
     pub visible: bool,
     /// atlas indices of the textures (0 = plain white); planes use `top`
     pub top: u32,
     pub side: u32,
     pub bottom: u32,
     /// tinted overlay over the side (grass block), 0 = none
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub overlay: u32,
     /// average colour of the top texture (before tinting)
     pub color: [u8; 3],
+    #[serde(default, skip_serializing_if = "is_no_tint")]
     pub tint: Tint,
     /// faces the tint applies to (TINT_* bits)
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub tinted: u8,
     /// see-through texture or fluid (leaves, glass, water): neighbours stay visible
+    #[serde(default, skip_serializing_if = "is_false")]
     pub transparent: bool,
-    /// the box in 1/16 block: x0, y0, z0, x1, y1, z1 (slabs, cactus, carpets …)
-    #[serde(rename = "box")]
+    /// the box in 1/16 block: x0, y0, z0, x1, y1, z1 (slabs, cactus, carpets …), default full
+    #[serde(rename = "box", default = "full_box", skip_serializing_if = "is_full_box")]
     pub bbox: [u8; 6],
     /// flat blocks: model rotation around y in quarter turns, clockwise seen from above
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -81,6 +89,33 @@ pub struct Block {
     /// (before `rot`)
     #[serde(default, skip_serializing_if = "is_zero_i")]
     pub slope: i8,
+    /// detailed blocks (stairs, fences, doors, torches …): index into the `shapes` table
+    /// (0 = none); the viewer draws those boxes instead of `box`
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub shape: u32,
+    /// detailed blocks: atlas indices of more textures, for the shape's texture slots 3, 4, …
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<u32>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn is_no_tint(v: &Tint) -> bool {
+    *v == Tint::None
+}
+
+fn full_box() -> [u8; 6] {
+    FULL
+}
+
+fn is_full_box(v: &[u8; 6]) -> bool {
+    *v == FULL
 }
 
 fn is_zero(v: &u8) -> bool {
@@ -107,15 +142,27 @@ struct Registry {
     client: String,
     blocks: Vec<Block>,
     biomes: Vec<Biome>,
+    /// shapes of detailed blocks, shared by all blocks with the same geometry (all wood stairs …):
+    /// a list of boxes, each `PART_LEN` numbers: x0 y0 z0 x1 y1 z1 (1/16 block), then per face
+    /// (up, down, north, south, west, east) u0 v0 u1 v1 (texture pixels) and the texture slot
+    /// (0 = the block's top, 1 = side, 2 = bottom, 3… = `extra`); a face that is not there is all `NO_FACE`.
+    /// Entry 0 is empty.
+    #[serde(default)]
+    shapes: Vec<Vec<Vec<u8>>>,
 }
+
+pub const PART_LEN: usize = 6 + 6 * 5;
+const NO_FACE: u8 = 255;
 
 pub struct Assets {
     reg: Registry,
+    /// `reg.client` plus a checksum of blocks.json: see `stamp()`
+    version: String,
     block_ids: HashMap<String, u16>,
     biome_ids: HashMap<String, u8>,
-    /// blocks registered per state ("minecraft:rail[shape=east_west]"): the property names of
-    /// their state keys, in key order
-    state_props: HashMap<String, Vec<String>>,
+    /// blocks registered per state ("minecraft:rail[shape=east_west]"): the properties of their
+    /// state keys in key order, with the value assumed when a palette entry does not give it
+    state_props: HashMap<String, Vec<(String, String)>>,
 }
 
 const PLAINS: Biome = Biome { name: String::new(), grass: [145, 189, 89], foliage: [119, 171, 47], water: [63, 118, 228] };
@@ -146,20 +193,39 @@ impl Assets {
                 None => return Ok(None),
             },
         };
+        // the tables are rebuilt from scratch when blocks.json is gone (e.g. a wiped map folder), and
+        // the ids may then come out in another order: the version must change with the content
+        let version = format!("{}:{:016x}", reg.client, fnv1a(&fs::read(&path).unwrap_or_default()));
         let block_ids = reg.blocks.iter().enumerate().skip(1).map(|(i, b)| (b.name.clone(), i as u16)).collect();
         let biome_ids = reg.biomes.iter().enumerate().skip(1).map(|(i, b)| (b.name.clone(), i as u8)).collect();
-        let mut state_props = HashMap::new();
+        // property -> values seen, per block registered by state
+        let mut seen: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
         for b in &reg.blocks {
             if let Some((base, key)) = b.name.strip_suffix(']').and_then(|n| n.split_once('[')) {
-                state_props.entry(base.to_string()).or_insert_with(|| key.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, _)| k.to_string()).collect());
+                let props = seen.entry(base.to_string()).or_insert_with(|| {
+                    key.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, _)| (k.to_string(), vec![])).collect()
+                });
+                for (k, v) in key.split(',').filter_map(|kv| kv.split_once('=')) {
+                    if let Some((_, vals)) = props.iter_mut().find(|(p, _)| p == k) {
+                        if !vals.iter().any(|x| x == v) {
+                            vals.push(v.to_string());
+                        }
+                    }
+                }
             }
         }
-        Ok(Some(Assets { reg, block_ids, biome_ids, state_props }))
+        let state_props = seen
+            .into_iter()
+            .map(|(base, props)| (base, props.into_iter().map(|(k, vals)| { let d = default_value(&k, &vals); (k, d) }).collect()))
+            .collect();
+        Ok(Some(Assets { reg, version, block_ids, biome_ids, state_props }))
     }
 
-    /// Identifies the tables (changes with the client jar).
+    /// Identifies the tables: changes with the client jar and with the content of blocks.json.
+    /// Viewers cache blocks.json / atlas.png by it and the tiles store ids into the tables, so it
+    /// must never stay the same when the ids change.
     pub fn stamp(&self) -> &str {
-        &self.reg.client
+        &self.version
     }
 
     /// Id of a block (0 = unknown), with namespace ("minecraft:stone").
@@ -172,8 +238,8 @@ impl Assets {
     pub fn block_state_id<'a>(&self, name: &str, prop: impl Fn(&str) -> Option<&'a str>) -> u16 {
         if let Some(props) = self.state_props.get(name) {
             let mut key = String::from(name);
-            for (i, p) in props.iter().enumerate() {
-                let Some(v) = prop(p) else { return self.block_id(name) };
+            for (i, (p, default)) in props.iter().enumerate() {
+                let v: &str = prop(p).unwrap_or(default.as_str());
                 key.push(if i == 0 { '[' } else { ',' });
                 key.push_str(p);
                 key.push('=');
@@ -208,6 +274,11 @@ impl Assets {
         };
         [0, 1, 2].map(|k| (b.color[k] as u32 * tint[k] as u32 / 255) as u8)
     }
+}
+
+/// 64-bit FNV-1a checksum.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// Size + modification time: cheap and changes with every new jar.
@@ -358,6 +429,292 @@ fn slope(model: &Model) -> i8 {
         .map_or(0, |a| if a > 0.0 { 1 } else if a < 0.0 { -1 } else { 0 })
 }
 
+/// The value a block state property most likely has when a palette entry leaves it out
+/// (its default state).
+fn default_value(prop: &str, values: &[String]) -> String {
+    const PREFERRED: [&str; 10] = ["north", "bottom", "lower", "straight", "north_south", "false", "left", "none", "floor", "y"];
+    // walls stand with a post, rods and chains upright
+    let pref: &[&str] = match prop {
+        "up" => &["true"],
+        "facing" if values.iter().any(|v| v == "up") => &["up"],
+        _ => &PREFERRED,
+    };
+    pref.iter()
+        .find(|p| values.iter().any(|v| v == *p))
+        .map(|p| p.to_string())
+        .or_else(|| values.first().cloned())
+        .unwrap_or_default()
+}
+
+/// Blocks drawn from their model's boxes, registered per state.
+fn detailed(short: &str) -> bool {
+    const SUFFIXES: [&str; 14] = [
+        "_stairs", "_fence", "_fence_gate", "_wall", "_pane", "_bars", "_door", "_trapdoor", "torch", "lantern", "chain", "_rod", "_bed", "_sign",
+    ];
+    SUFFIXES.iter().any(|s| short.ends_with(s)) && !short.ends_with("o_lantern") && short != "sea_lantern"
+}
+
+/// A model as a blockstate applies it.
+#[derive(Clone, Debug, PartialEq)]
+struct Applied {
+    model: String,
+    x: i64,
+    y: i64,
+    uvlock: bool,
+}
+
+fn applied(x: &Value) -> Option<Applied> {
+    let x = if let Some(a) = x.as_array() { a.first()? } else { x };
+    Some(Applied {
+        model: x.get("model")?.as_str()?.to_string(),
+        x: x.get("x").and_then(Value::as_i64).unwrap_or(0),
+        y: x.get("y").and_then(Value::as_i64).unwrap_or(0),
+        uvlock: x.get("uvlock").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Properties and the values a multipart condition tests.
+fn condition_props(when: &Value, out: &mut BTreeMap<String, Vec<String>>) {
+    let Some(obj) = when.as_object() else { return };
+    for (k, v) in obj {
+        if k == "OR" || k == "AND" {
+            for c in v.as_array().into_iter().flatten() {
+                condition_props(c, out);
+            }
+        } else if let Some(v) = v.as_str() {
+            let vals = out.entry(k.clone()).or_default();
+            for v in v.split('|') {
+                if !vals.iter().any(|x| x == v) {
+                    vals.push(v.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn condition_holds(when: &Value, state: &BTreeMap<String, String>) -> bool {
+    let Some(obj) = when.as_object() else { return true };
+    obj.iter().all(|(k, v)| match k.as_str() {
+        "OR" => v.as_array().is_some_and(|a| a.iter().any(|c| condition_holds(c, state))),
+        "AND" => v.as_array().is_none_or(|a| a.iter().all(|c| condition_holds(c, state))),
+        _ => v.as_str().is_some_and(|v| state.get(k).is_some_and(|s| v.split('|').any(|x| x == s))),
+    })
+}
+
+/// Every state of a blockstate file that looks different: (state key, models). Variants as
+/// listed; multipart blocks (fences, walls, panes) with every combination of the tested properties.
+fn block_states(v: &Value) -> Vec<(String, Vec<Applied>)> {
+    if let Some(variants) = v.get("variants").and_then(Value::as_object) {
+        return variants.iter().filter_map(|(k, x)| Some((k.clone(), vec![applied(x)?]))).collect();
+    }
+    let Some(parts) = v.get("multipart").and_then(Value::as_array) else { return vec![] };
+    let mut props = BTreeMap::new();
+    for p in parts {
+        if let Some(w) = p.get("when") {
+            condition_props(w, &mut props);
+        }
+    }
+    // values that never appear in a condition: the "off" value of the property
+    for vals in props.values_mut() {
+        let other = if vals.iter().all(|v| v == "true") {
+            "false"
+        } else if vals.iter().all(|v| ["low", "tall", "side", "up"].contains(&v.as_str())) {
+            "none"
+        } else {
+            continue;
+        };
+        vals.push(other.to_string());
+    }
+    if props.values().map(Vec::len).product::<usize>() > 1024 {
+        return vec![];
+    }
+    let mut states: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+    for (k, vals) in &props {
+        states = states
+            .into_iter()
+            .flat_map(|s| {
+                vals.iter().map(move |v| {
+                    let mut s = s.clone();
+                    s.insert(k.clone(), v.clone());
+                    s
+                })
+            })
+            .collect();
+    }
+    states
+        .into_iter()
+        .map(|s| {
+            let key = s.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",");
+            let models = parts
+                .iter()
+                .filter(|p| p.get("when").is_none_or(|w| condition_holds(w, &s)))
+                .filter_map(|p| applied(p.get("apply")?))
+                .collect();
+            (key, models)
+        })
+        .collect()
+}
+
+const DIR_NAMES: [&str; 6] = ["up", "down", "north", "south", "west", "east"];
+const UP: usize = 0;
+const DOWN: usize = 1;
+const NORTH: usize = 2;
+const SOUTH: usize = 3;
+const WEST: usize = 4;
+const EAST: usize = 5;
+
+/// Texture pixels a face shows by default (Minecraft's automatic UV, also used with `uvlock`).
+fn auto_uv(dir: usize, b: [f64; 6]) -> [f64; 4] {
+    match dir {
+        UP => [b[0], b[2], b[3], b[5]],
+        DOWN => [b[0], 16.0 - b[5], b[3], 16.0 - b[2]],
+        NORTH => [16.0 - b[3], 16.0 - b[4], 16.0 - b[0], 16.0 - b[1]],
+        SOUTH => [b[0], 16.0 - b[4], b[3], 16.0 - b[1]],
+        WEST => [b[2], 16.0 - b[4], b[5], 16.0 - b[1]],
+        _ => [16.0 - b[5], 16.0 - b[4], 16.0 - b[2], 16.0 - b[1]],
+    }
+}
+
+/// Rotates a point (1/16 block) and a face direction by the blockstate's x then y rotation
+/// (y: clockwise seen from above, like the game).
+fn rotate(mut p: [f64; 3], mut dir: usize, a: &Applied) -> ([f64; 3], usize) {
+    for _ in 0..(a.x.rem_euclid(360) / 90) {
+        p = [p[0], 16.0 - p[2], p[1]];
+        dir = match dir {
+            UP => SOUTH,
+            SOUTH => DOWN,
+            DOWN => NORTH,
+            NORTH => UP,
+            d => d,
+        };
+    }
+    for _ in 0..(a.y.rem_euclid(360) / 90) {
+        p = [16.0 - p[2], p[1], p[0]];
+        dir = match dir {
+            NORTH => EAST,
+            EAST => SOUTH,
+            SOUTH => WEST,
+            WEST => NORTH,
+            d => d,
+        };
+    }
+    (p, dir)
+}
+
+/// Boxes of a model as the blockstate applies it, in the `shapes` part format. `slot` maps a
+/// face's texture to the block's texture slot (top, side, bottom, extra …). Planes (iron bars,
+/// chains) are kept as boxes of zero thickness; tilted boxes are moved, not tilted, except tall
+/// ones leaning sideways (wall torches): those are cut into short pieces moved one by one, a
+/// staircase that leans like the model.
+fn model_parts(model: &Model, a: &Applied, mut slot: impl FnMut(&str) -> u8) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    for e in &model.elements {
+        let (Some(from), Some(to)) = (e.get("from"), e.get("to")) else { continue };
+        let lo0 = [0, 1, 2].map(|i| num(from, i).min(num(to, i)));
+        let hi0 = [0, 1, 2].map(|i| num(from, i).max(num(to, i)));
+        if (0..3).filter(|&i| hi0[i] - lo0[i] <= 0.0).count() > 1 {
+            continue;
+        }
+        let Some(faces) = e.get("faces").and_then(Value::as_object) else { continue };
+        let orig = [lo0[0], lo0[1], lo0[2], hi0[0], hi0[1], hi0[2]];
+        let rotation = e.get("rotation").map(|r| {
+            let angle = r.get("angle").and_then(Value::as_f64).unwrap_or(0.0);
+            let o = r.get("origin").map_or([8.0; 3], |o| [0, 1, 2].map(|i| num(o, i)));
+            (angle, o, r.get("axis").and_then(Value::as_str).unwrap_or(""))
+        });
+        let height = hi0[1] - lo0[1];
+        let leaning = rotation.is_some_and(|(angle, _, axis)| angle.abs() >= 10.0 && (axis == "x" || axis == "z"));
+        let pieces = if leaning && height >= 6.0 { (height / 3.5).ceil() as usize } else { 1 };
+        for piece in 0..pieces {
+            let (f0, f1) = (piece as f64 / pieces as f64, (piece + 1) as f64 / pieces as f64);
+            let mut lo = lo0;
+            let mut hi = hi0;
+            lo[1] = lo0[1] + height * f0;
+            hi[1] = lo0[1] + height * f1;
+            if let Some((angle, o, axis)) = rotation {
+                let c = [0, 1, 2].map(|i| (lo[i] + hi[i]) / 2.0 - o[i]);
+                let (sin, cos) = angle.to_radians().sin_cos();
+                let m = match axis {
+                    "x" => [c[0], c[1] * cos - c[2] * sin, c[1] * sin + c[2] * cos],
+                    "y" => [c[0] * cos + c[2] * sin, c[1], -c[0] * sin + c[2] * cos],
+                    "z" => [c[0] * cos - c[1] * sin, c[0] * sin + c[1] * cos, c[2]],
+                    _ => c,
+                };
+                for i in 0..3 {
+                    lo[i] += m[i] - c[i];
+                    hi[i] += m[i] - c[i];
+                }
+            }
+            let (p0, _) = rotate(lo, UP, a);
+            let (p1, _) = rotate(hi, UP, a);
+            let b = [0, 1, 2].map(|i| p0[i].min(p1[i]).clamp(0.0, 16.0).round());
+            let t = [0, 1, 2].map(|i| p0[i].max(p1[i]).clamp(0.0, 16.0).round());
+            if (0..3).any(|i| t[i] < b[i]) || (0..3).filter(|&i| t[i] == b[i]).count() > 1 {
+                continue;
+            }
+            let bx = [b[0], b[1], b[2], t[0], t[1], t[2]];
+            let mut part = bx.map(|v| v as u8).to_vec();
+            part.resize(PART_LEN, NO_FACE);
+            for (d, name) in DIR_NAMES.iter().enumerate() {
+                // of a cut box only the lowest piece has the bottom, the highest the top
+                if (d == DOWN && piece > 0) || (d == UP && piece + 1 < pieces) {
+                    continue;
+                }
+                let Some(f) = faces.get(*name) else { continue };
+                let Some(tex) = f.get("texture").and_then(Value::as_str).and_then(|t| resolve_texture(model, t)) else { continue };
+                let (_, to_dir) = rotate([0.0; 3], d, a);
+                let given = f.get("uv").filter(|u| u.as_array().is_some_and(|u| u.len() == 4));
+                let mut uv = match given {
+                    _ if a.uvlock => auto_uv(to_dir, bx),
+                    Some(u) => [0, 1, 2, 3].map(|i| num(u, i)),
+                    None => auto_uv(d, orig),
+                };
+                if pieces > 1 && d != UP && d != DOWN && !a.uvlock {
+                    // the piece's share of the side texture (v grows downwards)
+                    let (v0, v1) = (uv[1], uv[3]);
+                    uv[1] = v0 + (1.0 - f1) * (v1 - v0);
+                    uv[3] = v0 + (1.0 - f0) * (v1 - v0);
+                }
+                let o = 6 + to_dir * 5;
+                for (k, v) in uv.iter().enumerate() {
+                    part[o + k] = v.clamp(0.0, 16.0).round() as u8;
+                }
+                part[o + 4] = slot(&tex);
+            }
+            if part[6..].iter().any(|&v| v != NO_FACE) {
+                out.push(part);
+            }
+        }
+    }
+    out
+}
+
+/// Top, side and bottom texture (with "is tinted") of detailed models: up/down face of the
+/// widest box, side face of the biggest one.
+fn part_textures(models: &[&Model]) -> Faces {
+    let mut best: [Option<(f64, String, bool)>; 3] = [None, None, None];
+    for m in models {
+        for e in &m.elements {
+            let (Some(from), Some(to)) = (e.get("from"), e.get("to")) else { continue };
+            let size = [0, 1, 2].map(|i| (num(to, i) - num(from, i)).abs());
+            let Some(faces) = e.get("faces").and_then(Value::as_object) else { continue };
+            let mut take = |slot: usize, score: f64, dirs: &[&str]| {
+                let Some(f) = dirs.iter().find_map(|d| faces.get(*d)) else { return };
+                let Some(tex) = f.get("texture").and_then(Value::as_str).and_then(|t| resolve_texture(m, t)) else { return };
+                if best[slot].as_ref().is_none_or(|(s, _, _)| score > *s) {
+                    best[slot] = Some((score, tex, f.get("tintindex").is_some()));
+                }
+            };
+            take(0, size[0] * size[2], &["up"]);
+            take(1, size[0] * size[1] * size[2], &["north", "south", "east", "west"]);
+            take(2, size[0] * size[2], &["down"]);
+        }
+    }
+    let [top, side, bottom] = best.map(|b| b.map(|(_, t, tinted)| (t, tinted)));
+    let side = side.or_else(|| top.clone());
+    Faces { bbox: FULL, kind: Kind::Parts, top: top.or_else(|| side.clone()), bottom: bottom.or_else(|| side.clone()), side, overlay: None }
+}
+
 fn num(v: &Value, i: usize) -> f64 {
     v.get(i).and_then(Value::as_f64).unwrap_or(0.0)
 }
@@ -466,8 +823,8 @@ fn tint_for(block: &str, tinted: bool) -> Tint {
     }
 }
 
-/// First animation frame of a texture as 16×16 RGBA.
-fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
+/// A texture of the jar as RGBA pixels with width and height.
+fn decode_png(jar: &mut Jar, tex: &str) -> Option<(Vec<[u8; 4]>, usize, usize)> {
     let bytes = jar.bytes(&format!("assets/minecraft/textures/{tex}.png"))?;
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -476,6 +833,67 @@ fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
     let info = reader.next_frame(&mut buf).ok()?;
     let (w, h) = (info.width as usize, info.height as usize);
     let channels = info.color_type.samples();
+    let px = buf[..w * h * channels]
+        .chunks_exact(channels)
+        .map(|px| match channels {
+            1 => [px[0], px[0], px[0], 255],
+            2 => [px[0], px[0], px[0], px[1]],
+            3 => [px[0], px[1], px[2], 255],
+            _ => [px[0], px[1], px[2], px[3]],
+        })
+        .collect();
+    Some((px, w, h))
+}
+
+/// A rectangle of a crop spec: x, y, w, h (in base pixels), upside down.
+type Rect = ([usize; 4], bool);
+
+fn crop_rects(rects: &str) -> Vec<Rect> {
+    rects
+        .split(';')
+        .filter_map(|r| {
+            let v: Vec<&str> = r.split(',').collect();
+            let n = |i: usize| v.get(i)?.parse::<usize>().ok();
+            Some(([n(0)?, n(1)?, n(2)?, n(3)?], v.get(4) == Some(&"v")))
+        })
+        .collect()
+}
+
+/// First animation frame of a texture as 16×16 RGBA. `crop|<texture>|<base width>|x,y,w,h[,v];…`
+/// (entity textures: chests, heads) cuts rectangles out of a texture (coordinates for the texture
+/// at `base width`), stacks them top to bottom (`v`: upside down) and scales that to 16×16.
+fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
+    if let Some(spec) = tex.strip_prefix("crop|") {
+        let mut it = spec.split('|');
+        let (name, base, rects) = (it.next()?, it.next()?.parse::<usize>().ok()?, crop_rects(it.next()?));
+        let (px, w, h) = decode_png(jar, name)?;
+        let k = w as f64 / base as f64;
+        let width = rects.iter().map(|r| r.0[2]).max()?;
+        // rows of the stacked image: (rectangle, row in it)
+        let mut rows: Vec<(usize, usize)> = vec![];
+        for (i, (r, flip)) in rects.iter().enumerate() {
+            for y in 0..r[3] {
+                rows.push((i, if *flip { r[3] - 1 - y } else { y }));
+            }
+        }
+        if width == 0 || rows.is_empty() {
+            return None;
+        }
+        let mut out = vec![0u8; TEX * TEX * 4];
+        for y in 0..TEX {
+            let (ri, ry) = rows[y * rows.len() / TEX];
+            let r = rects[ri].0;
+            for x in 0..TEX {
+                let rx = (x * width / TEX).min(r[2].max(1) - 1);
+                let (sx, sy) = (((r[0] + rx) as f64 * k) as usize, ((r[1] + ry) as f64 * k) as usize);
+                if sx < w && sy < h {
+                    out[(y * TEX + x) * 4..(y * TEX + x) * 4 + 4].copy_from_slice(&px[sy * w + sx]);
+                }
+            }
+        }
+        return Some(out);
+    }
+    let (px, w, h) = decode_png(jar, tex)?;
     if w == 0 || h < w {
         return None;
     }
@@ -483,15 +901,90 @@ fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
     for y in 0..TEX {
         for x in 0..TEX {
             let (sx, sy) = (x * w / TEX, y * w / TEX); // first frame = top w×w square
-            let p = (sy * w + sx) * channels;
-            let px = &buf[p..p + channels];
-            let rgba = match channels {
-                1 => [px[0], px[0], px[0], 255],
-                2 => [px[0], px[0], px[0], px[1]],
-                3 => [px[0], px[1], px[2], 255],
-                _ => [px[0], px[1], px[2], px[3]],
-            };
-            out[(y * TEX + x) * 4..(y * TEX + x) * 4 + 4].copy_from_slice(&rgba);
+            out[(y * TEX + x) * 4..(y * TEX + x) * 4 + 4].copy_from_slice(&px[sy * w + sx]);
+        }
+    }
+    Some(out)
+}
+
+/// Blocks the game draws as entities (no model in the jar): chests and mob heads, as boxes with
+/// textures cut out of the entity textures. Per state: (state key, models as applied).
+fn entity_models(short: &str) -> Option<Vec<(String, Vec<(Model, Applied)>)>> {
+    const QUARTERS: [(&str, i64); 4] = [("north", 0), ("east", 90), ("south", 180), ("west", 270)];
+    let model = |elements: Value, textures: &[(&str, String)]| Model {
+        textures: textures.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        elements: elements.as_array().cloned().unwrap_or_default(),
+    };
+    let applied = |y: i64| Applied { model: String::new(), x: 0, y, uvlock: false };
+    // one box, the front on the north side (turned by the state)
+    let cuboid = |from: [u8; 3], to: [u8; 3]| {
+        let face = |t: &str| serde_json::json!({"uv": [0, 0, 16, 16], "texture": t});
+        serde_json::json!([{ "from": from, "to": to, "faces": {
+            "up": face("#top"), "down": face("#bottom"), "north": face("#front"),
+            "south": face("#back"), "west": face("#side"), "east": face("#side")
+        }}])
+    };
+    // chests: lid (14×5×14) over body (14×10×14) of the 64×64 chest texture, the lock on the front
+    let chest = match short.trim_start_matches("waxed_") {
+        "chest" => Some("normal"),
+        "trapped_chest" => Some("trapped"),
+        "ender_chest" => Some("ender"),
+        "copper_chest" => Some("copper"),
+        "exposed_copper_chest" => Some("copper_exposed"),
+        "weathered_copper_chest" => Some("copper_weathered"),
+        "oxidized_copper_chest" => Some("copper_oxidized"),
+        _ => None,
+    };
+    if let Some(t) = chest {
+        let crop = |rects: &str| format!("crop|entity/chest/{t}|64|{rects}");
+        let tex = [
+            ("top", crop("28,0,14,14")),
+            ("bottom", crop("14,19,14,14")),
+            ("front", crop("42,14,14,5;42,33,14,10,v")),
+            ("back", crop("14,14,14,5;14,33,14,10,v")),
+            ("side", crop("0,14,14,5;0,33,14,10,v")),
+        ];
+        let mut out = vec![];
+        for (facing, y) in QUARTERS {
+            // the halves of a double chest reach the block edge where they meet (a left half of a
+            // chest facing north: east)
+            for (kind, x0, x1) in [("single", 1, 15), ("left", 1, 16), ("right", 0, 15)] {
+                out.push((format!("facing={facing},type={kind}"), vec![(model(cuboid([x0, 0, 1], [x1, 14, 15]), &tex), applied(y))]));
+            }
+        }
+        return Some(out);
+    }
+    // heads: the 8×8×8 head of the mob texture (piglin: 10 wide)
+    let (base, wall) = match short.strip_suffix("_wall_skull").or_else(|| short.strip_suffix("_wall_head")) {
+        Some(b) => (b, true),
+        None => (short.strip_suffix("_skull").or_else(|| short.strip_suffix("_head"))?, false),
+    };
+    let texture = match base {
+        "skeleton" => "entity/skeleton/skeleton",
+        "wither_skeleton" => "entity/skeleton/wither_skeleton",
+        "zombie" => "entity/zombie/zombie",
+        "creeper" => "entity/creeper/creeper",
+        "piglin" => "entity/piglin/piglin",
+        "player" => "entity/player/wide/steve",
+        _ => return None,
+    };
+    let crop = |rect: &str| format!("crop|{texture}|64|{rect}");
+    let (tex, x0, x1) = if base == "piglin" {
+        ([("top", crop("8,0,10,8")), ("bottom", crop("18,0,10,8")), ("front", crop("8,8,10,8")), ("back", crop("26,8,10,8")), ("side", crop("0,8,8,8"))], 3, 13)
+    } else {
+        ([("top", crop("8,0,8,8")), ("bottom", crop("16,0,8,8")), ("front", crop("8,8,8,8")), ("back", crop("24,8,8,8")), ("side", crop("0,8,8,8"))], 4, 12)
+    };
+    let mut out = vec![];
+    if wall {
+        // facing = where the face looks; the head hangs on the wall behind it
+        for (facing, y) in QUARTERS {
+            out.push((format!("facing={facing}"), vec![(model(cuboid([x0, 4, 8], [x1, 12, 16]), &tex), applied(y))]));
+        }
+    } else {
+        // rotation 0 looks south, 4 west, 8 north, 12 east (to the nearest quarter)
+        for r in 0..16 {
+            let y = [180, 270, 0, 90][((r + 2) / 4) % 4];
+            out.push((format!("rotation={r}"), vec![(model(cuboid([x0, 0, 4], [x1, 8, 12]), &tex), applied(y))]));
         }
     }
     Some(out)
@@ -584,6 +1077,8 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
     };
 
     let mut built: HashMap<String, Block> = HashMap::new();
+    let mut shapes: Vec<Vec<Vec<u8>>> = vec![vec![]];
+    let mut shape_ids: HashMap<Vec<Vec<u8>>, u32> = HashMap::new();
     for path in jar.names("assets/minecraft/blockstates/", ".json") {
         let short = path.trim_start_matches("assets/minecraft/blockstates/").trim_end_matches(".json").to_string();
         let name = format!("minecraft:{short}");
@@ -602,6 +1097,8 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
             bbox: FULL,
             rot: 0,
             slope: 0,
+            shape: 0,
+            extra: vec![],
         };
         // fluids have no model elements; mushroom blocks are built from single faces
         let mushroom = format!("block/{short}");
@@ -664,6 +1161,131 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
                 built.insert(state, b);
             }
         }
+        // detailed blocks: one entry per state, drawn from the model's boxes
+        let entity = entity_models(&short);
+        if detailed(&short) || entity.is_some() {
+            let states: Vec<(String, Vec<(Model, Applied)>)> = match entity {
+                Some(states) => states,
+                None => jar
+                    .json(&path)
+                    .map(|v| block_states(&v))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(key, applied)| {
+                        let models: Option<Vec<(Model, Applied)>> =
+                            applied.into_iter().map(|a| Some((load_model(&mut jar, &a.model)?, a))).collect();
+                        Some((key, models?))
+                    })
+                    .collect(),
+            };
+            let mut per_state: Vec<(String, Block)> = vec![];
+            for (key, with_models) in &states {
+                let models: Vec<&Model> = with_models.iter().map(|(m, _)| m).collect();
+                let f = part_textures(&models);
+                let Some((top_tex, top_tinted)) = f.top.clone() else { continue };
+                let side_tex = f.side.clone().map(|s| s.0).unwrap_or_else(|| top_tex.clone());
+                let bottom_tex = f.bottom.clone().map(|s| s.0).unwrap_or_else(|| top_tex.clone());
+                // further textures (bed sides, chest fronts …) get slots 3, 4, … (`extra`)
+                let mut extra_tex: Vec<String> = vec![];
+                let mut slot = |t: &str| -> u8 {
+                    if t == top_tex {
+                        0
+                    } else if t == side_tex {
+                        1
+                    } else if t == bottom_tex {
+                        2
+                    } else if let Some(i) = extra_tex.iter().position(|x| x == t) {
+                        3 + i as u8
+                    } else if extra_tex.len() < 8 {
+                        extra_tex.push(t.to_string());
+                        2 + extra_tex.len() as u8
+                    } else {
+                        1
+                    }
+                };
+                let mut all: Vec<Vec<u8>> = vec![];
+                for (m, a) in with_models {
+                    all.extend(model_parts(m, a, &mut slot));
+                }
+                // the same box from several model parts (pane posts): one box with all their faces
+                let mut parts: Vec<Vec<u8>> = vec![];
+                for p in all {
+                    match parts.iter_mut().find(|q| q[..6] == p[..6]) {
+                        Some(q) => {
+                            for o in (6..PART_LEN).step_by(5) {
+                                if q[o] == NO_FACE {
+                                    q[o..o + 5].copy_from_slice(&p[o..o + 5]);
+                                }
+                            }
+                        }
+                        None => parts.push(p),
+                    }
+                }
+                if parts.is_empty() {
+                    continue;
+                }
+                let mut bbox = [16, 16, 16, 0, 0, 0];
+                for p in &parts {
+                    for i in 0..3 {
+                        bbox[i] = bbox[i].min(p[i]);
+                        bbox[i + 3] = bbox[i + 3].max(p[i + 3]);
+                    }
+                }
+                let shape = *shape_ids.entry(parts.clone()).or_insert_with(|| {
+                    shapes.push(parts);
+                    (shapes.len() - 1) as u32
+                });
+                let (top, color, a1) = texture(&mut jar, &top_tex).unwrap_or((0, [128, 128, 128], false));
+                let (side, _, a2) = texture(&mut jar, &side_tex).unwrap_or((top, color, false));
+                let (bottom, _, a3) = texture(&mut jar, &bottom_tex).unwrap_or((top, color, false));
+                let extra: Vec<u32> = extra_tex.iter().map(|t| texture(&mut jar, t).map_or(side, |t| t.0)).collect();
+                let flag = |f: &Option<(String, bool)>, bit: u8| if f.as_ref().is_some_and(|(_, t)| *t) { bit } else { 0 };
+                let tinted = (if top_tinted { TINT_TOP } else { 0 }) | flag(&f.side, TINT_SIDE) | flag(&f.bottom, TINT_BOTTOM);
+                // stairs are solid ground for the block stacks and seen from above in 2D
+                let stairs = short.ends_with("_stairs");
+                let b = Block {
+                    name: if key.is_empty() { name.clone() } else { format!("{name}[{key}]") },
+                    kind: if stairs { Kind::Cube } else { Kind::Parts },
+                    visible: stairs,
+                    top,
+                    side,
+                    bottom,
+                    overlay: 0,
+                    color,
+                    tint: tint_for(&name, tinted != 0),
+                    tinted,
+                    transparent: a1 || a2 || a3,
+                    bbox,
+                    rot: 0,
+                    slope: 0,
+                    shape,
+                    extra,
+                };
+                per_state.push((key.clone(), b));
+            }
+            // the plain entry (26.x stores blocks in their default state without properties)
+            let mut values: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (key, _) in &per_state {
+                for (k, v) in key.split(',').filter_map(|kv| kv.split_once('=')) {
+                    values.entry(k).or_default().push(v.to_string());
+                }
+            }
+            let default_key = per_state.first().map(|(key, _)| {
+                key.split(',')
+                    .filter_map(|kv| kv.split_once('='))
+                    .map(|(k, _)| format!("{k}={}", default_value(k, &values[k])))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            if let Some((_, b)) = per_state.iter().find(|(k, _)| Some(k) == default_key.as_ref()).or(per_state.first()) {
+                block = Block { name: name.clone(), ..b.clone() };
+            }
+            for (key, b) in per_state {
+                if !key.is_empty() {
+                    built.insert(b.name.clone(), b);
+                }
+            }
+        }
         built.insert(name, block);
     }
     let unknown = Block {
@@ -681,11 +1303,13 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
         bbox: FULL,
         rot: 0,
         slope: 0,
+        shape: 0,
+        extra: vec![],
     };
     let mut blocks = vec![unknown];
     for b in old.blocks.iter().skip(1) {
         // known id: new data if the block still exists, else keep the old entry
-        blocks.push(built.remove(&b.name).unwrap_or_else(|| b.clone()));
+        blocks.push(built.remove(&b.name).unwrap_or_else(|| Block { shape: 0, extra: vec![], ..b.clone() }));
     }
     let mut rest: Vec<Block> = built.into_values().collect();
     rest.sort_by(|a, b| a.name.cmp(&b.name));
@@ -715,7 +1339,7 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
     biomes.truncate(256);
 
     write_atlas(&out.join("atlas.png"), &atlas).map_err(|e| format!("atlas: {e}"))?;
-    Ok(Registry { client: stamp, blocks, biomes })
+    Ok(Registry { client: stamp, blocks, biomes, shapes })
 }
 
 fn write_atlas(path: &Path, textures: &[Vec<u8>]) -> std::io::Result<()> {
@@ -751,6 +1375,132 @@ mod tests {
     fn model(elements: Value, textures: Value) -> Model {
         let textures = textures.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
         Model { textures, elements: elements.as_array().unwrap().clone() }
+    }
+
+    fn rot(y: i64, uvlock: bool) -> Applied {
+        Applied { model: String::new(), x: 0, y, uvlock }
+    }
+
+    #[test]
+    fn multipart_states_enumerate_tested_properties() {
+        let fence = json!({"multipart": [
+            {"apply": {"model": "block/oak_fence_post"}},
+            {"apply": {"model": "block/oak_fence_side", "uvlock": true}, "when": {"north": "true"}},
+            {"apply": {"model": "block/oak_fence_side", "uvlock": true, "y": 90}, "when": {"east": "true"}}
+        ]});
+        let states = block_states(&fence);
+        assert_eq!(states.len(), 4);
+        let (key, models) = states.iter().find(|(k, _)| k == "east=true,north=false").unwrap();
+        assert_eq!(key, "east=true,north=false");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].y, 90);
+        assert!(models[1].uvlock);
+        // walls: "none" is never tested, but is a state; OR conditions
+        let wall = json!({"multipart": [
+            {"apply": {"model": "post"}, "when": {"OR": [{"up": "true"}, {"north": "tall"}]}},
+            {"apply": {"model": "side"}, "when": {"north": "low"}}
+        ]});
+        let states = block_states(&wall);
+        assert_eq!(states.len(), 6); // north: tall/low/none × up: true/false
+        let models = |k: &str| states.iter().find(|(key, _)| key == k).unwrap().1.len();
+        assert_eq!(models("north=none,up=false"), 0);
+        assert_eq!(models("north=tall,up=false"), 1);
+        assert_eq!(models("north=low,up=true"), 2);
+    }
+
+    #[test]
+    fn default_values_of_missing_properties() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(default_value("facing", &v(&["east", "north", "south", "west"])), "north");
+        assert_eq!(default_value("shape", &v(&["inner_left", "straight"])), "straight");
+        assert_eq!(default_value("open", &v(&["true", "false"])), "false");
+        assert_eq!(default_value("up", &v(&["false", "true"])), "true");
+        assert_eq!(default_value("power", &v(&["3", "0"])), "3");
+    }
+
+    #[test]
+    fn detailed_block_names() {
+        for n in ["oak_stairs", "oak_fence", "oak_fence_gate", "cobblestone_wall", "glass_pane", "iron_bars", "oak_door", "oak_trapdoor", "torch", "wall_torch", "lantern", "iron_chain", "lightning_rod", "red_bed", "oak_sign", "oak_wall_sign", "oak_hanging_sign"] {
+            assert!(detailed(n), "{n}");
+        }
+        for n in ["jack_o_lantern", "sea_lantern", "stone", "oak_slab"] {
+            assert!(!detailed(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn stairs_parts_rotate_with_the_state() {
+        let stairs = model(json!([
+            {"from": [0, 0, 0], "to": [16, 8, 16], "faces": {"up": {"texture": "#top"}, "north": {"texture": "#side"}}},
+            {"from": [8, 8, 0], "to": [16, 16, 16], "faces": {"up": {"texture": "#top"}, "west": {"texture": "#side"}}}
+        ]), json!({"top": "block/oak_planks", "side": "block/oak_planks"}));
+        // facing east: no rotation, step on the east half
+        let p = model_parts(&stairs, &rot(0, true), |_| 0);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[1][..6], [8, 8, 0, 16, 16, 16]);
+        // facing north = y 270: step on the north half; its west face now faces south
+        let p = model_parts(&stairs, &rot(270, true), |_| 0);
+        assert_eq!(p[1][..6], [0, 8, 0, 16, 16, 8]);
+        let face = |part: &Vec<u8>, dir: usize| part[6 + dir * 5..6 + dir * 5 + 5].to_vec();
+        assert_eq!(face(&p[1], WEST), vec![NO_FACE; 5]);
+        // uvlock: texture follows the world position (south face: u = x, v = 16 - y)
+        assert_eq!(face(&p[1], SOUTH), vec![0, 0, 16, 8, 0]);
+        // upside down (x 180): the slab goes to the top
+        let top = Applied { x: 180, ..rot(0, true) };
+        assert_eq!(model_parts(&stairs, &top, |_| 0)[0][..6], [0, 8, 0, 16, 16, 16]);
+    }
+
+    #[test]
+    fn wall_torch_is_moved_and_keeps_its_uv() {
+        let torch = model(json!([{"from": [-1, 3.5, 7], "to": [1, 13.5, 9],
+            "rotation": {"origin": [0, 3.5, 8], "axis": "z", "angle": -22.5},
+            "faces": {"north": {"uv": [7, 6, 9, 16], "texture": "#torch"}, "up": {"uv": [7, 6, 9, 8], "texture": "#torch"}}}]),
+            json!({"torch": "block/torch"}));
+        let p = model_parts(&torch, &rot(0, false), |_| 0);
+        // leaning away from the wall (west): three pieces, each a bit further east, inside the block
+        let boxes: Vec<&[u8]> = p.iter().map(|p| &p[..6]).collect();
+        assert_eq!(boxes, [[0, 3, 7, 2, 7, 9], [1, 6, 7, 3, 10, 9], [2, 10, 7, 4, 13, 9]]);
+        // each piece shows its share of the side texture, only the top piece has the top
+        let north: Vec<&[u8]> = p.iter().map(|p| &p[6 + NORTH * 5..6 + NORTH * 5 + 4]).collect();
+        assert_eq!(north, [[7, 13, 9, 16], [7, 9, 9, 13], [7, 6, 9, 9]]);
+        assert_eq!(p.iter().filter(|p| p[6 + UP * 5] != NO_FACE).count(), 1);
+        assert_eq!(p[2][6 + UP * 5..6 + UP * 5 + 4], [7, 6, 9, 8]);
+        // facing south (y 90): against the north wall, the north face turned east
+        let p = model_parts(&torch, &rot(90, false), |_| 0);
+        assert_eq!(p[0][..6], [7, 3, 0, 9, 7, 2]);
+        assert_eq!(p[2][..6], [7, 10, 2, 9, 13, 4]);
+        assert_eq!(p[0][6 + EAST * 5..6 + EAST * 5 + 4], [7, 13, 9, 16]);
+    }
+
+    #[test]
+    fn chests_and_heads_are_built_per_state() {
+        let chest = entity_models("chest").unwrap();
+        assert_eq!(chest.len(), 12);
+        let (key, models) = &chest[1];
+        assert_eq!(key, "facing=north,type=left");
+        // a left half facing north reaches the east edge
+        let p = model_parts(&models[0].0, &models[0].1, |_| 0);
+        assert_eq!(p[0][..6], [1, 0, 1, 16, 14, 15]);
+        assert_eq!(entity_models("waxed_oxidized_copper_chest").unwrap()[0].1[0].0.textures["top"], "crop|entity/chest/copper_oxidized|64|28,0,14,14");
+        // a skull with rotation 8 looks north: the front texture on the north face
+        let skull = entity_models("skeleton_skull").unwrap();
+        assert_eq!(skull.len(), 16);
+        let (m, a) = &skull[8].1[0];
+        let mut slots = vec![];
+        let p = model_parts(m, a, |t| { slots.push(t.to_string()); slots.len() as u8 - 1 });
+        assert_eq!(p[0][..6], [4, 0, 4, 12, 8, 12]);
+        assert!(slots[p[0][6 + NORTH * 5 + 4] as usize].ends_with("8,8,8,8"));
+        // on a wall facing east: against the west edge
+        let wall = entity_models("zombie_wall_head").unwrap();
+        let (m, a) = &wall[1].1[0];
+        assert_eq!(model_parts(m, a, |_| 0)[0][..6], [0, 4, 4, 8, 12, 12]);
+        assert!(entity_models("dragon_head").is_none());
+        assert!(entity_models("stone").is_none());
+    }
+
+    #[test]
+    fn crop_specs() {
+        assert_eq!(crop_rects("1,2,3,4;5,6,7,8,v"), vec![([1, 2, 3, 4], false), ([5, 6, 7, 8], true)]);
     }
 
     #[test]

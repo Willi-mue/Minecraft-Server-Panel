@@ -42,38 +42,71 @@ without restarting; Python changes need a restart (no `--reload` is configured).
 
 ## Architecture
 
-**Threading model (the key thing to understand).** `app/server.py` holds a single global
-`ServerManager` (`manager`). The Java process runs via `subprocess.Popen` with a dedicated reader
+**Several servers (instances).** `app/instances.py`: the panel runs any number of independent
+servers. `Instance(id)` only computes paths (`server_dir`, `backup_dir`, `settings_file`, `map_dir`);
+the first server is `main` and keeps the old paths (`DATA_DIR/server`, `BACKUP_DIR`,
+`DATA_DIR/settings.json`), others live in `DATA_DIR/servers/<id>/` with backups in
+`BACKUP_DIR/<id>/`; names in `DATA_DIR/servers.json`. Jars, Java and the data pack library are
+shared (`versions._download_lock` serialises downloads). Every module function that touches server
+files takes the instance as first parameter (`backup.*`, `access.*`, `properties.*`,
+`world.*`, `datapacks.*` except the library) — pass it explicitly, never fall back to a global;
+only `config.load_settings()`, `backup.level_name()` and the `livemap.*` functions default to `main`
+(None = main). Every server has its own live map (`Instance.map_dir`, `livemap.renderer_for(inst)` /
+`tracker_for(inst)`; one mapgen process at a time over all servers). Per-server API
+routes live on the `srv` router under `/api/servers/{sid}/…` (dependency `server()` → manager);
+global: login, `/api/servers` (list/create/rename/delete), version list, jar deletion. Each
+additional server gets a free `server-port` from `SERVER_PORTS`; `_check_port()` refuses to start
+two running servers on one port.
+
+**Threading model (the key thing to understand).** `app/server.py` holds one `ServerManager` per
+instance in `managers` (`get_manager(id)`). The Java process runs via `subprocess.Popen` with a dedicated reader
 thread parsing stdout line by line. Long actions (start/stop/restart/backup/download) go through
 `_exclusive()`, which takes a non-blocking lock and runs the action in a daemon thread. A second
 concurrent action raises `BusyError`, which `main._busy()` maps to HTTP 409 (and `RuntimeError` /
-`ValueError` to 400). Errors inside the thread are reported to the UI via `manager.info()` rather
+`ValueError` to 400). Errors inside the thread are reported to the UI via `m.info()` rather
 than raised.
 
-**Live feed.** Threads push events to WebSocket clients through `manager._emit()`, which uses
+**Live feed.** Threads push events to WebSocket clients through `ServerManager._emit()` → the shared
+`hub` (`EventHub`), which tags every event with `"server": id` and uses
 `loop.call_soon_threadsafe` onto per-client `asyncio.Queue`s (slow clients get events dropped).
 Event types: `log`, `chat`, `status`, `stats` — handled in the `switch (msg.type)` in
-`app/static/app.js`. The frontend loads the full snapshot from `GET /api/state` and then applies
-WS events. `_stats_loop` in `main.py` skips work when there are no subscribers (keep it that way;
+`app/static/app.js` (events of other servers only update their status dot in the sidebar). The
+frontend is a sidebar + pages layout with hash routing `#/<server>/<page>` (`route()`,
+`switchServer()`); per-server URLs are built with `S(path)`, and async loads drop their result if
+the selected server changed meanwhile. It loads the full snapshot from
+`GET /api/servers/<id>/state` and then applies WS events. `_stats_loop` in `main.py` skips work when there are no subscribers (keep it that way;
 idle cost is a stated feature).
 
 **Server state comes from parsing console output.** Regexes at the top of `server.py` detect
 "Done" (→ RUNNING), joins/leaves, chat, `list` output, whitelist rejections, "Saved the game"
 (used to synchronise live backups: `save-off` → `save-all flush` → wait → zip → `save-on`), and
-EULA prompts. Changes to Minecraft's log format break these.
+EULA prompts. Changes to Minecraft's log format break these. Joins/leaves are also written to
+`players.json` (first/last seen, `players.record`). The panel's own queries go through
+`ServerManager.ask(commands, pattern, expected, timeout)`: matching answer lines are swallowed
+(`_consume_query`, checked first in `_handle_line`) — used for TPS (`query_tick`: Paper `tps` +
+`mspt`, else `tick query` on 1.20.3+) and game rules (`gamerule <name>`). `_tick_loop` asks every 10 s
+only while a WebSocket is connected; `_history_loop` keeps one point per 30 s (CPU/RAM/players/TPS,
+`ServerManager.history`, 1 h) only for running servers.
 
-**Online vs. offline mutations.** Whitelist/ops changes (`app/access.py`, `_change` in `main.py`)
+**Online vs. offline mutations.** Whitelist/ops/ban changes (`app/access.py`, `_change` in `main.py`)
 send server commands when the server is RUNNING, edit `whitelist.json` / `ops.json` /
-`server.properties` directly when it is stopped, and refuse with 409 while starting/stopping.
+`banned-players.json` / `server.properties` directly when it is stopped, and refuse with 409 while
+starting/stopping. Game rules work the same way (`gamerules.py`, `/api/servers/{sid}/gamerules`).
+Player actions (`POST …/players/{name}/action`: gamemode, spawn, heal, clear, kick) build the
+console command server-side from a validated name — never pass client text into a command.
 
 **Configuration layering** (`app/config.py`): env vars are static defaults; anything changed in the
-UI (flavor, version, RAM, map toggle) is persisted to `<DATA_DIR>/settings.json` and overrides
+UI (flavor, version, RAM, map toggle) is persisted to the server's `settings.json` and overrides
 them. `settings.json` also records `world_version`/`world_flavor` (written when the server reaches
 "Done") which drives the downgrade warning in the UI.
 
 **Jars** (`app/versions.py`): stored as `<JARS_DIR>/<flavor>-<version>.jar` with a sidecar
 `.json` holding required Java major, build and JVM flags. Vanilla comes from Mojang's version
-manifest, Paper from the PaperMC Fill v3 API; downloads are hash-verified. `import_paper_cache`
+manifest, Paper from the PaperMC Fill v3 API (hash-verified), Fabric from meta.fabricmc.net (the
+server *launcher* jar: no checksum, so size + valid jar are checked; `build` = loader version; it
+downloads Vanilla + libraries into the server folder on first start). `versions.update()` = newest
+Paper build / Fabric loader. Changing the flavor in the settings makes a `_before-<flavor>` backup
+first (`ServerManager.backup_before`). `import_paper_cache`
 hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla install.
 `java.pick()` chooses the smallest installed runtime ≥ the required major.
 
@@ -92,17 +125,32 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   cross = plants / vine / flat = rails etc. / none = torches, entities), tint per face, grass side
   overlay, `transparent`; biome colours from `data/minecraft/worldgen/biome` + colormaps. Writes
   `blocks.json` (block + biome registry; ids are stable — append only — since the tiles store them)
-  and `atlas.png` (16 px textures with real alpha). Rebuilt when the jar or `FORMAT` changes; a
+  and `atlas.png` (16 px textures with real alpha). Rebuilt when the jar or `FORMAT` changes (or blocks.json is missing); the stamp (`Assets::stamp`, maps.json `blocks`, viewers cache by it) includes a checksum of blocks.json, so new ids always mean a new stamp; a
   change of tables re-renders everything (`state.json` `assets`). Per region it then also writes
-  `b/<x>_<z>.png` (top box: block id R,G + biome B) and `v/<x>_<z>.bin` (zlib "MGV1": u8 count per
-  column + i16 y / u16 id entries = the block stack from the top down to the lowest solid ground of
-  the column and its neighbours, always ending on a solid block so caves/overhangs have a floor; of
-  a water run only the surface; where a neighbour shows air (cave, overhang) a stack goes down
-  to that neighbour's lowest visible air (fixed point over per-column air runs, spreads only
-  through air, `CAVE_REACH` columns), computed on a grid padded with the adjacent chunks of the 4 neighbour regions,
-  so cave walls are real blocks, also across region borders). Rails are registered per `shape`
+  `b/<x>_<z>.png` (top box: block id R,G + biome B), `p/<x>_<z>.png` (plant / flat block over it,
+  id R,G; drawn over the ground in the textured 2D view) and `v/<x>_<z>.bin` (zlib "MGV2": u8 count per
+  column + i16 y / u16 id entries, top down). It holds only what the map may show: air runs open to
+  the sky (`open_runs`: runs touching the open space above a column's top or a lower neighbour's,
+  then BFS through overlapping runs of neighbour columns up to `--cave-reach` columns, default 32)
+  and the solid blocks next to that air (`Chunk::visible_stack`). Hidden rock/caves become `FILL` runs
+  (0xFFFF: solid, not shown, down to the next entry), visible air after FILL starts with `AIR_MARK`
+  (0xFFFE), gaps are air, below a water entry water, below the last entry solid (air when the last entry is `AIR_MARK`:
+  the End's void; runs reaching the world bottom and void columns count as open); so the files do not
+  give away hidden caves. `--all-caves` writes the same stacks with every air run shown to `c/`
+  (same pass; maps.json `caves`); the viewer loads them only while the height slice is on.
+  Computed on a grid padded with 2 chunks of the 4 neighbour regions; a
+  change of `VOXEL_FORMAT`/`VOXEL_RULES`, the reach or all-caves re-renders (`state.json` `visibility`). The panel
+  keeps reach + `all_caves` in `DATA_DIR/map_visibility.json` (`livemap.load_visibility`,
+  `GET/PUT /api/map/visibility`; not in `DATA_DIR/map/`, which is public). Rails are registered per `shape`
   state (`minecraft:rail[shape=east_west]`, `rot`/`slope`; `Assets::block_state_id`). Boxes keep their model size (`box`, each face taken from the
-  element that owns it: cactus, slabs, carpets). The 2D colour tiles use
+  element that owns it: cactus, slabs, carpets). Detailed blocks (`detailed()`: stairs, fences, walls,
+  panes, bars, doors, trapdoors, gates, torches, lanterns, chains, rods, beds, signs) are registered per state (multipart
+  = every combination of the tested properties) and point to a shared `shapes` entry: boxes with per-face
+  UV + texture slot (0 top, 1 side, 2 bottom, 3… the block's `extra` textures; `model_parts`, tilted boxes are
+  moved, not tilted; tall ones leaning sideways like wall torches are cut into pieces moved one by one);
+  missing state properties fall back to `default_value`. Chests and mob heads have no model in the
+  jar: `entity_models` builds boxes per state with textures cut out of the entity textures
+  (`crop|<texture>|<base width>|x,y,w,h[,v];…` texture names). blocks.json is served gzipped. The 2D colour tiles use
   texture average × biome tint.
   `cargo test` covers parsing, colors, shading, tiles, model/biome resolution.
 - `app/livemap.py` runs mapgen as a low-priority subprocess (`Renderer`, one at a time) and tracks
@@ -122,24 +170,70 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   leaves: leaf faces are never culled), crossed planes for plants, vines on solid neighbours,
   translucent water surface with the bed darkened/tinted by depth; three materials per 128-block
   tile (opaque, cutout with alphaTest + polygonOffset, water); positions are Int16 in 1/16 block.
-  Air gaps next to a neighbour that is solid below its stack get that neighbour's wall (cave
-  walls); between two leaf blocks only one face. A pool of up to 3 workers builds the meshes (every
-  worker decodes every region); step changes have a ±10 % hysteresis. Farther: coloured height
-  boxes, 2–16 blocks. Biome colours are blended over 5×5 columns. Towards a coarser neighbour tile
+  Air gaps next to a neighbour that is solid there (FILL / below its stack: a cave beyond the reach)
+  get a plain rock wall, gaps ending on FILL a floor/ceiling; between two leaf blocks only one face. A pool of up to 3 workers builds the meshes; one
+  worker decodes a region and the others `adopt` it (SharedArrayBuffer when the page is
+  cross-origin isolated, else a copy). Step = `stepFor(distance / (view height / 900))`, doubled
+  for tiles outside the view frustum (built last); ±10 % hysteresis; from step 4 a whole region is
+  one mesh (`r.whole`, the tiles stay until it is built and vice versa). Farther: coloured height
+  boxes, 2–16 blocks (equal tops merged per row). Biome colours are blended over 5×5 columns. Towards a coarser neighbour tile
   (the build message's `fine[n,s,w,e]` says which are step 1 too; tiles turn `dirty` when that
   flips) step-1 tiles add "just in case" faces / fill walls down to `coverMin` (heights at the
   step-aligned columns), ending 1/16 below the top (else z-fighting lines); top faces overlap tile
-  edges by 1/16 (T-junction cracks); coarse tiles use a 16-block band minimum. The atlas is
-  uploaded with 32 px cells (8 px border, `atlasTexture`; worker `uvSub` must match) so linear
-  mipmaps + anisotropy work without bleeding. The camera stays ≥2 blocks above the terrain. 2D: from Leaflet zoom 2 (4 px/block) a GridLayer draws textured tiles in the worker over
+  edges by 1/16 (T-junction cracks); coarse tiles use a 16-block band minimum. Greedy meshing (worker `Merger`):
+  equal full-block tops become rectangles per height plane, equal walls vertical runs that are then
+  joined along their plane (grass side overlay included); colours rounded to steps of 4. Textures
+  repeat in the shader (`repeatTextures` in map3d.js): per vertex a texture index (`tex`) and `uv`
+  in texture widths, fract() + textureGrad picks the atlas cell. The atlas is uploaded with 32 px
+  cells (8 px border, `atlasTexture`; the shader must match) so linear mipmaps + anisotropy work
+  without bleeding. Geometry arrays are dropped after the GPU upload (`freeArray`).
+  `state.view3d.stats` gives tiles/steps/triangles per part. The camera stays ≥2 blocks above the terrain.
+  Water, plants (cross/flat/vine) and leaves are own meshes (`plants`/`leaves` buffers) so the
+  viewer's display settings hide them without a rebuild. Height slice (`setOptions({slice: {lo, hi}})`,
+  band ≤ 64 blocks, moved over the world height): clipping planes at once, then the tiles are
+  rebuilt with `slice` (blocks outside skipped, top faces at the cut, plain dark cut faces over FILL,
+  coarse boxes clamped; `heightAt` is clamped too, so the camera can go down). Right drag (Ctrl + left) turns the camera about itself (`turn`, MapControls only pans/zooms). WASD/arrows fly along the
+  view direction (several keys at once), Space/Shift up/down, mouse wheel while a fly key is held =
+  speed (`fly` in map3d.js, `options.flySpeed`); the slice band is set on a bar at the right edge. Display settings (`map.js` `settings`, localStorage):
+  markers/names/spawn via `<body>` classes, the rest via `setOptions`. 2D: from Leaflet zoom 2 (4 px/block) a GridLayer draws textured tiles in the worker over
   the colour tiles. Tiles are re-fetched with
-  ETag after a render. Headless `--screenshot` doesn't wait for workers: test via DevTools protocol.
+  ETag after a render. Headless `--screenshot` doesn't wait for workers: test via DevTools protocol
+  (Playwright with `channel="msedge"` works on Windows).
+  Players: 2D markers and far 3D markers show the head; within `MODEL_NEAR` blocks the 3D view shows
+  a 3D model built from the skin (`player3d.js`, turned towards the camera: no facing is tracked).
+  Clicking a player in the list opens a card (whole skin from the front, position, Follow, Copy
+  /tp); follow mode glides the view (`goTo(p, FOLLOW_MS)`, `view3d.glide`) and ends on drag/fly.
+  A click on the map picks a spot (y from the height tiles, worker message `height`); clicking the
+  coordinate box copies `/execute in <dim> run tp @s x y z` (execCommand fallback on plain http).
 - `app/mapserver.py` serves viewer (Leaflet and three.js vendored), tiles, `maps.json`,
-  `blocks.json`/`atlas.png` and `players.json` on `MAP_PORT` (separate uvicorn server in its own thread). The map port must never
-  expose anything else.
+  `blocks.json`/`atlas.png`, `players.json` and `skins/<uuid>.png` on `MAP_PORT` (separate uvicorn server in its own thread):
+  every server at `/s/<id>/` (viewer served there too, so relative URLs need no prefix; status field
+  `map_path`); `/` serves main, but its viewer moves on to the server this browser showed last
+  (localStorage `map-last-server`, not when the URL has a position hash), `servers.json` = maps that are on and rendered (the viewer's
+  server switch). The map port must never
+  expose anything else. All responses carry COOP/COEP (`_Isolation`) for the viewer's shared
+  worker memory: everything the viewer loads must stay same-origin (or send CORP).
+- Hall of fame (`app/leaderboard.py`, `stats.json` on the map port, modal `static/map/leaderboard.js`):
+  tier list by share of advancements done (recipes excluded; S ≥ 60 %, A ≥ 40 %, B ≥ 25 %, C ≥ 10 %),
+  top 3 per record (`RECORDS`: movement, combat, mining, life; derived from `minecraft:custom` /
+  `mined` / `crafted` / `broken` in `stats_of`), monster hunters / nemesis per mob (`killed`,
+  `killed_by`), every advancement with who has it, a page per player. Titles, frames and mob names
+  from the client jar the map already has (never downloads), else from the ids. Recomputed when a
+  player file changes; Minecraft writes them only on autosave / leave, so opening it sends a
+  `save-all` while players are online (≤ 1/min, not during an action) and the page reloads once
+  (`saving`). Public on purpose: only names, skin ids, counts and advancement / mob ids. "Me" tab:
+  the player picked in this browser (localStorage `lb-me:<path>`), else `me.json`: the player whose
+  last login (`LOGIN_RE` in server.py -> `leaderboard.remember_login`, memory only) came from the
+  visitor's address, if exactly one. Addresses are never stored or sent.
+- Player heads: `livemap.skins` maps names to uuids via the server's `usercache.json` and downloads
+  skins from Mojang (session server → only `textures.minecraft.net`, PNG ≤ 64 KB, daily refresh,
+  1 h back-off) into `DATA_DIR/cache/skins/`; `players.json` names the `skin` once it exists; the
+  viewer cuts out face + hat (hat ignored on old 64×32 skins when fully opaque).
 - The old squaremap plugin is deleted on server start (`remove_squaremap`).
 
-**Other modules:** `datapacks.py` (library `<DATA_DIR>/datapacks/` = source of truth, copies
+**Other modules:** `servericon.py` (`server-icon.png` for Minecraft's server list: the logo
+`app/static/map/logo.svg` as a 64×64 PNG drawn from `LOGO_RECTS` (a test keeps both equal), put in
+place before each start when missing; upload via `PUT /icon`, the page scales the image), `datapacks.py` (library `<DATA_DIR>/datapacks/` = source of truth, copies
 installed into `<world>/datapacks/`; enabled state lives per world in level.dat
 `Data.DataPacks.Enabled/Disabled` — online via `minecraft:datapack` + `save-all` until level.dat shows
 it, offline by editing level.dat with `nbt.py`, a byte-exact NBT round-trip codec; "New world"
@@ -148,21 +242,39 @@ game settings dialog), `world.py` (minimal NBT reader: `level.dat` → `Data.Ver
 `settings.json` has no `world_version`), `backup.py` (`restore()` validates zip member paths, makes a
 `_before-restore` safety backup and protects the restored file from retention cleanup).
 `archive_*.zip` files (written by "New world", `ServerManager._new_world`) must never be deleted:
-`cleanup()` only globs `backup_*.zip` — keep it that way.
+`cleanup()` only globs `backup_*.zip` — keep it that way. `backup.add_upload()` turns an uploaded world
+zip (server world, or single-player save with level.dat in the root / one folder) into
+`backup_<stamp>_upload.zip` with this server's folder names, checked like a restore.
+`addons.py`: mods (Fabric, `server/mods/`) and plugins (Paper, `server/plugins/`), kind from the
+server's flavor; metadata from `fabric.mod.json` (incl. jar-in-jar ids for dependency checks, version
+ranges via `addons.matches`) or `plugin.yml`/`paper-plugin.yml` (tiny YAML subset parser, no PyYAML);
+disabling = rename to `.jar.disabled`; Modrinth search/install (required deps)/updates (by SHA-512 via
+`/version_files/update`), downloads only from Modrinth's CDN with SHA-512 check.
+`players.py`: profiles from `usercache.json`, `world/players/{stats,data}` (26.x) or
+`world/{stats,playerdata}` (older), world spawn from level.dat (`Data.spawn` or `SpawnX/Y/Z`), skins via
+`livemap.fetch_skin` (shared cache); the browser cuts out the head (`headUrl()` in app.js).
+`gamerules.py`: 26.x keeps rules in `<world>/dimensions/minecraft/overworld/data/minecraft/game_rules.dat`
+(typed, `minecraft:snake_case`), older worlds in level.dat `Data.GameRules` (strings); never hard-code the
+list — `KNOWN` only adds labels. `sessions.py`: see below.
 
 **Security-relevant invariants:**
 - User-supplied flavor/version ids are validated (`validate_flavor`, `config.validate_version`)
-  before being used in file paths — keep that for any new path built from request data.
+  before being used in file paths — keep that for any new path built from request data. Same for
+  server ids (`instances.validate_id`, applied in the `server()` dependency).
 - Console commands are rejected if they contain newlines (stdin injection).
-- Sessions are in-memory (lost on restart), cookie `panel_session`, httponly + samesite=strict.
+- Sessions survive restarts: `DATA_DIR/sessions.json` holds only SHA-256 hashes of the tokens plus
+  a fingerprint of the password (a new `PANEL_PASSWORD` logs everybody out); 30 days, sliding
+  (`require_auth` re-sends the cookie on renewal). Cookie `panel_session`, httponly + samesite=strict.
+- Add-on and world uploads are streamed to a temp file (`main._receive`) with a size limit.
 
 ## Docker notes
 
 The image is based on `eclipse-temurin:25-jre-noble`; extra Java runtimes from the `EXTRA_JAVA`
 build arg are installed to `/opt/java/<major>` by `docker/install-java.py`. The entrypoint fixes
 mount ownership as root then drops to uid 1000 (`minecraft`). `stop_grace_period: 90s` gives the
-server time to save; `manager.shutdown()` sends `stop` on app exit. `HEALTHCHECK` polls the
-unauthenticated `GET /api/health`. Ports: 47318 panel, 47319 live map, 25565 Minecraft.
+server time to save; `shutdown_all()` sends `stop` to every running server in parallel on app exit.
+`HEALTHCHECK` polls the unauthenticated `GET /api/health`. Ports: 47318 panel, 47319 live map,
+25565 Minecraft, 25566–25569 additional servers.
 
 ## Project conventions
 

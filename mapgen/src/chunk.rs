@@ -157,14 +157,15 @@ pub struct Column {
     pub biome: u8,
     /// highest non-air block (plants included), where the 3D block stack starts
     pub top: i32,
-    /// highest solid ground (not leaves, not water, not plants)
-    pub ground: i32,
+    /// block id of the highest plant / flat block (rails, lily pads) above the coloured block,
+    /// drawn over it in the textured 2D view (0 = none)
+    pub plant: u16,
 }
 
 /// Vanilla's bedrock roof spans the top 5 blocks below the ceiling (Nether: y 123..=127).
 const ROOF_DEPTH: i32 = 5;
 
-pub const EMPTY: Column = Column { color: colors::NONE, y: i32::MIN, depth: 0, block: 0, biome: 0, top: i32::MIN, ground: i32::MIN };
+pub const EMPTY: Column = Column { color: colors::NONE, y: i32::MIN, depth: 0, block: 0, biome: 0, top: i32::MIN, plant: 0 };
 
 pub struct Chunk {
     sections: Vec<Option<Section>>, // indexed by section y - min_section
@@ -215,6 +216,8 @@ impl Chunk {
                 kinds.push(match kind {
                     Kind::None => 0,
                     Kind::Cube => 1,
+                    // drawn over the ground in the 2D view
+                    Kind::Cross | Kind::Flat => 3,
                     _ => 2,
                 });
                 leafy.push(p.name().ends_with("_leaves"));
@@ -236,7 +239,7 @@ impl Chunk {
         Some(Chunk { sections, min_section, surface })
     }
 
-    fn min_y(&self) -> i32 {
+    pub fn min_y(&self) -> i32 {
         self.min_section * 16
     }
 
@@ -270,64 +273,52 @@ impl Chunk {
         c.kind == 1 && !c.water && !c.leafy
     }
 
-    /// Highest solid ground at or below `from` (not leaves, water or plants), i32::MIN if none.
-    /// Under a thin ceiling (overhangs of ravines, bridges, cave mouths: air within
-    /// `OVERHANG` blocks below the solid) the ground is the floor further down, so the
-    /// neighbours export their walls down to it.
-    fn ground(&self, x: usize, z: usize, from: i32) -> i32 {
-        const OVERHANG: i32 = 8;
-        let mut y = from;
-        while y >= self.min_y() && !self.solid(x, y, z) {
-            y -= 1;
-        }
-        if y < self.min_y() {
-            return i32::MIN;
-        }
-        let mut ground = y;
-        loop {
-            let Some(air) = (1..=OVERHANG).map(|k| ground - k).take_while(|&a| a >= self.min_y()).find(|&a| !self.solid(x, a, z)) else {
-                return ground;
-            };
-            let mut y = air;
-            while y >= self.min_y() && !self.solid(x, y, z) {
-                y -= 1;
-            }
-            if y < self.min_y() {
-                return ground;
-            }
-            ground = y;
-        }
-    }
-
-    /// The 3D block stack of a column from `top` down to `stop`: (y, block id) of every drawn
-    /// block, top first. Of a run of water only the surface is kept (the viewer fills it down to the
-    /// next block). The stack always ends on a solid block (it goes on below `stop` through caves,
-    /// under bridges …, at most 128 blocks), so the viewer may treat everything below as solid.
-    /// At most 255 entries.
-    pub fn stack(&self, x: usize, z: usize, top: i32, stop: i32, out: &mut Vec<(i16, u16)>) -> u8 {
+    /// The 3D block stack of a column from `top` down to `bottom` as the map may show it (see
+    /// `render::voxels`): non-solid blocks where `seen(y)`, solid blocks next to seen air (above,
+    /// below, or beside: `side(y)`), everything else as FILL runs; visible air after a FILL run
+    /// starts with AIR_MARK. Of a run of water only the surface is kept. At most 255 entries;
+    /// trailing FILL is dropped (below the last entry counts as solid anyway). Seen air down to the
+    /// world bottom (the End's void) ends with an AIR_MARK at the bottom.
+    pub fn visible_stack(&self, x: usize, z: usize, top: i32, bottom: i32, seen: impl Fn(i32) -> bool, side: impl Fn(i32) -> bool, out: &mut Vec<(i16, u16)>) -> u8 {
+        use crate::render::{AIR_MARK, FILL};
         let start = out.len();
         let mut prev_water = false;
-        let mut solid = false;
         let mut y = top;
-        while y >= self.min_y() && out.len() - start < 255 {
-            if y < stop && (solid || y < stop - 128) {
-                break;
-            }
+        while y >= bottom.max(self.min_y()) && out.len() - start < 255 {
             let c = self.block(x, y, z);
-            if c.water {
-                if !prev_water {
-                    out.push((y as i16, c.id));
+            let solid = c.kind == 1 && !c.water && !c.leafy;
+            let after_fill = out.len() > start && out[out.len() - 1].1 == FILL;
+            if !solid && seen(y) {
+                if c.water {
+                    if !prev_water {
+                        out.push((y as i16, c.id));
+                    }
+                    prev_water = true;
+                } else {
+                    prev_water = false;
+                    if c.kind != 0 {
+                        out.push((y as i16, c.id));
+                    } else if after_fill {
+                        out.push((y as i16, AIR_MARK));
+                    }
                 }
-                prev_water = true;
-                solid = false;
+            } else if solid && (y >= top || seen(y + 1) || seen(y - 1) || side(y)) {
+                prev_water = false;
+                out.push((y as i16, c.id));
             } else {
                 prev_water = false;
-                if c.kind != 0 {
-                    out.push((y as i16, c.id));
+                if !after_fill {
+                    out.push((y as i16, FILL));
                 }
-                solid = c.kind == 1 && !c.leafy;
             }
             y -= 1;
+        }
+        while out.len() > start && out[out.len() - 1].1 == FILL {
+            out.pop();
+        }
+        let floor = self.min_y();
+        if y < floor && out.len() - start < 255 && !self.solid(x, floor, z) && seen(floor) && self.block(x, floor, z).kind == 0 {
+            out.push((floor as i16, AIR_MARK));
         }
         (out.len() - start) as u8
     }
@@ -400,8 +391,12 @@ impl Chunk {
             },
         };
         let mut y = top;
+        let mut plant = 0;
         while y >= self.min_y() {
             let cell = self.block(x, y, z);
+            if cell.kind == 3 && plant == 0 {
+                plant = cell.id;
+            }
             if cell.water {
                 let surface = y;
                 let mut depth = 0u16;
@@ -410,14 +405,12 @@ impl Chunk {
                     depth += 1;
                 }
                 let biome = self.biome(x, surface, z);
-                let ground = self.ground(x, z, y);
-                return Column { color: colors::WATER, y: surface, depth: depth + 1, block: cell.id, biome, top, ground };
+                return Column { color: colors::WATER, y: surface, depth: depth + 1, block: cell.id, biome, top, plant };
             }
             if cell.visible {
                 // a block without map colour (glass …) that has a texture: use stone grey in 2D fallback
                 let color = if cell.color == colors::NONE { colors::STONE } else { cell.color };
-                let ground = self.ground(x, z, y);
-                return Column { color, y, depth: 0, block: cell.id, biome: self.biome(x, y, z), top, ground };
+                return Column { color, y, depth: 0, block: cell.id, biome: self.biome(x, y, z), top, plant };
             }
             y -= 1;
         }
@@ -476,7 +469,7 @@ mod tests {
         })).unwrap();
         let chunk = Chunk::parse(&nbt, None).unwrap();
         assert_eq!(chunk.surface_y(3, 5), Some(-49));
-        assert_eq!(chunk.column(3, 5, None), Column { color: colors::GRASS, y: -49, depth: 0, block: 0, biome: 0, top: -49, ground: -49 });
+        assert_eq!(chunk.column(3, 5, None), Column { color: colors::GRASS, y: -49, depth: 0, block: 0, biome: 0, top: -49, plant: 0 });
     }
 
     #[test]
@@ -509,30 +502,54 @@ mod tests {
     }
 
     #[test]
-    fn block_stack_keeps_floating_leaves_and_one_water_surface() {
+    fn visible_stack_hides_what_is_not_seen() {
+        use crate::render::{AIR_MARK, FILL};
         let whole = |y: i8, name: &str| fastnbt::nbt!({"Y": y, "block_states": {"palette": [name]}});
+        // stone 0..15, air 16..31 (a cave), stone 32..47, water 48..63
         let nbt = fastnbt::to_bytes(&fastnbt::nbt!({
             "Status": "minecraft:full",
             "yPos": 0,
-            "sections": [whole(0, "minecraft:stone"), whole(1, "minecraft:air"), whole(2, "minecraft:oak_leaves"),
-                         whole(3, "minecraft:water"), whole(4, "minecraft:air")]
+            "sections": [whole(0, "minecraft:stone"), whole(1, "minecraft:air"), whole(2, "minecraft:stone"), whole(3, "minecraft:water")]
         })).unwrap();
         let chunk = Chunk::parse(&nbt, None).unwrap();
-        // ground is the stone, not the leaves or the water above
-        assert_eq!(chunk.ground(0, 0, 63), 15);
         let mut out = vec![];
-        let n = chunk.stack(0, 0, 63, 10, &mut out);
-        // water 63..48 -> one entry, leaves 47..32, air 31..16 skipped, stone 15..10
-        assert_eq!(n as usize, 1 + 16 + 6);
-        assert_eq!(out[0].0, 63);
-        assert_eq!(out[1].0, 47);
-        assert_eq!(out[16].0, 32);
-        assert_eq!(out[17].0, 15);
-        assert_eq!(out.last().unwrap().0, 10);
-        // a stop inside the air gap goes on down to the stone
+        // only the water is in view: one water entry, the lake floor, then nothing (solid below)
+        chunk.visible_stack(0, 0, 63, 0, |y| y >= 48, |_| false, &mut out);
+        assert_eq!(out.iter().map(|e| e.0).collect::<Vec<_>>(), vec![63, 47]);
+        assert_eq!(out[1].1, 0); // a block (no texture tables: id 0), not FILL
+        // the cave is in view too: rock between lake and cave is FILL, its ceiling and floor are shown
         out.clear();
-        chunk.stack(0, 0, 63, 25, &mut out);
-        assert_eq!(out.last().unwrap().0, 15);
+        chunk.visible_stack(0, 0, 63, 0, |y| y >= 48 || (16..=31).contains(&y), |_| false, &mut out);
+        assert_eq!(out, vec![(63, 0), (47, 0), (46, FILL), (32, 0), (15, 0)]);
+        // only the lower part of the cave (a reveal box ending at y 25): the hidden air above it is
+        // FILL too, the visible air starts with AIR_MARK
+        out.clear();
+        chunk.visible_stack(0, 0, 63, 0, |y| y >= 48 || (16..=25).contains(&y), |_| false, &mut out);
+        assert_eq!(out, vec![(63, 0), (47, 0), (46, FILL), (25, AIR_MARK), (15, 0)]);
+        // a neighbour sees into the rock at y 40 (cave beside): that block is shown
+        out.clear();
+        chunk.visible_stack(0, 0, 63, 0, |y| y >= 48, |y| y == 40, &mut out);
+        assert_eq!(out, vec![(63, 0), (47, 0), (46, FILL), (40, 0)]);
+    }
+
+    #[test]
+    fn visible_stack_ends_with_air_over_the_void() {
+        use crate::render::{AIR_MARK, FILL};
+        let whole = |y: i8, name: &str| fastnbt::nbt!({"Y": y, "block_states": {"palette": [name]}});
+        // an End island: void 0..31, end stone 32..47
+        let nbt = fastnbt::to_bytes(&fastnbt::nbt!({
+            "Status": "minecraft:full",
+            "yPos": 0,
+            "sections": [whole(0, "minecraft:air"), whole(1, "minecraft:air"), whole(2, "minecraft:end_stone")]
+        })).unwrap();
+        let chunk = Chunk::parse(&nbt, None).unwrap();
+        let mut out = vec![];
+        chunk.visible_stack(0, 0, 47, -1, |y| y >= 48 || y <= 31, |_| false, &mut out);
+        assert_eq!(out, vec![(47, 0), (46, FILL), (32, 0), (0, AIR_MARK)]);
+        // the void not in view: solid below the last entry as before
+        out.clear();
+        chunk.visible_stack(0, 0, 47, 47, |y| y >= 48, |_| false, &mut out);
+        assert_eq!(out, vec![(47, 0)]);
     }
 
     #[test]
@@ -566,31 +583,6 @@ mod tests {
         assert_eq!(runs, vec![(20, 8), (6, 4)]);
     }
 
-    #[test]
-    fn ground_looks_under_thin_ceilings() {
-        // stone 0..15, air 16..31, a 16-block thick "ceiling" of stone 32..47 (too thick: ground on top)
-        let whole = |y: i8, name: &str| fastnbt::nbt!({"Y": y, "block_states": {"palette": [name]}});
-        let thick = fastnbt::to_bytes(&fastnbt::nbt!({"Status": "minecraft:full", "yPos": 0,
-            "sections": [whole(0, "minecraft:stone"), whole(1, "minecraft:air"), whole(2, "minecraft:stone")]})).unwrap();
-        assert_eq!(Chunk::parse(&thick, None).unwrap().ground(0, 0, 47), 47);
-        // 4-block overhang (y 28..31) above air 16..27: the floor at 15 is the ground
-        let thin = fastnbt::to_bytes(&fastnbt::nbt!({"Status": "minecraft:full", "yPos": 0,
-            "sections": [whole(0, "minecraft:stone"),
-                {"Y": 1i8, "block_states": {"palette": ["minecraft:air", "minecraft:stone"],
-                 "data": fastnbt::LongArray::new(over_top_rows(12, 16))}}]})).unwrap();
-        assert_eq!(Chunk::parse(&thin, None).unwrap().ground(0, 0, 31), 15);
-    }
-
-    /// Section data (4 bits per block, palette [air, stone]): stone in the layers >= `from`.
-    fn over_top_rows(from: usize, layers: usize) -> Vec<i64> {
-        let mut longs = vec![0i64; 256];
-        for i in 0..4096 {
-            if i / 256 >= from && i / 256 < layers {
-                longs[i / 16] |= 1i64 << ((i % 16) * 4);
-            }
-        }
-        longs
-    }
 
     #[test]
     fn palette_entry_shapes() {

@@ -4,120 +4,196 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Minecraft Server Panel</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%237fc8a4'/><rect x='3' y='4' width='3' height='3' fill='%2313291f'/><rect x='10' y='4' width='3' height='3' fill='%2313291f'/><rect x='6' y='8' width='4' height='4' fill='%2313291f'/></svg>">
+  <link rel="icon" href="/static/map/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <!-- Login -->
   <div id="login" class="login hidden">
     <form id="login-form" class="card login-card">
-      <div class="brand"><span class="logo"></span> Server Panel</div>
+      <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Server Panel</span></div>
       <label for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" autofocus required>
       <button class="btn primary" type="submit">Log in</button>
-      <p id="login-error" class="error"></p>
+      <p id="login-error" class="error" role="alert"></p>
     </form>
   </div>
 
-  <div id="app" class="app hidden">
-    <header class="topbar">
-      <div class="brand"><span class="logo"></span> Server Panel</div>
-      <div class="status">
-        <span id="state-pill" class="pill">…</span>
-        <span id="version-label" class="muted"></span>
-        <span id="uptime-label" class="muted"></span>
-        <span id="task-label" class="task hidden"></span>
+  <div id="app" class="shell hidden">
+    <!-- ============ Sidebar ============ -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div class="brand-text">
+          <span class="brand-name">Server Panel</span>
+          <span id="server-count" class="muted small-text"></span>
+        </div>
       </div>
-      <div class="topbar-right">
-        <a id="map-link" class="btn small hidden" target="_blank" rel="noopener" title="Live map (share this link with players)">
-          <svg class="i"><use href="/static/icons.svg#ph-map-trifold"/></svg> Map
-          <svg class="i"><use href="/static/icons.svg#ph-arrow-square-out"/></svg>
+
+      <div class="server-switch">
+        <ul id="server-list" class="server-list" aria-label="Servers"></ul>
+        <button type="button" id="new-server-btn" class="btn dashed small">
+          <svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> New server
+        </button>
+      </div>
+
+      <nav class="nav" aria-label="Pages">
+        <a href="#" data-page="overview"><svg class="i"><use href="/static/icons.svg#ph-squares-four"/></svg><span>Overview</span></a>
+        <a href="#" data-page="players"><svg class="i"><use href="/static/icons.svg#ph-users"/></svg><span>Players</span><span id="nav-players" class="nav-badge"></span></a>
+        <a href="#" data-page="addons"><svg class="i"><use href="/static/icons.svg#ph-puzzle-piece"/></svg><span>Add-ons</span></a>
+        <a href="#" data-page="world"><svg class="i"><use href="/static/icons.svg#ph-globe"/></svg><span>World &amp; backups</span></a>
+        <a href="#" data-page="server"><svg class="i"><use href="/static/icons.svg#ph-hard-drives"/></svg><span>Server</span></a>
+        <a id="map-link" class="hidden" target="_blank" rel="noopener" title="Live map (share this link with players)">
+          <svg class="i"><use href="/static/icons.svg#ph-map-trifold"/></svg><span>Live map</span>
+          <svg class="i ext"><use href="/static/icons.svg#ph-arrow-square-out"/></svg>
         </a>
-        <span id="ws-indicator" class="ws" title="Live connection"></span>
+      </nav>
+
+      <div class="sidebar-foot">
+        <span class="live"><span id="ws-indicator" class="ws" aria-hidden="true"></span><span id="ws-text">Connecting…</span></span>
         <button id="logout" class="icon-btn" title="Log out" aria-label="Log out">
           <svg class="i"><use href="/static/icons.svg#ph-sign-out"/></svg>
         </button>
       </div>
-    </header>
+    </aside>
 
-    <div id="eula-banner" class="banner hidden">
-      <svg class="i"><use href="/static/icons.svg#ph-warning"/></svg>
-      <div class="banner-text">
-        <strong>Minecraft EULA not accepted.</strong>
-        The server only starts after you accept the
-        <a href="https://aka.ms/MinecraftEULA" target="_blank" rel="noopener">Minecraft EULA</a>.
-      </div>
-      <button id="eula-accept" class="btn primary small">I accept the EULA</button>
-    </div>
-
-    <main class="layout">
-      <!-- Column 1: console + chat -->
-      <div class="col">
-        <section class="card console-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-terminal-window"/></svg> Console</h2>
-            <label class="check">
-              <input type="checkbox" id="autoscroll" checked>
-              <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
-              Auto-scroll
-            </label>
+    <!-- ============ Content ============ -->
+    <main class="content">
+      <header class="page-head">
+        <div class="titles">
+          <h1 id="page-title">Overview</h1>
+          <div class="status-line">
+            <span id="server-name" class="server-name"></span>
+            <span id="state-pill" class="pill">…</span>
+            <span id="version-label"></span>
+            <span id="uptime-label"></span>
+            <span id="port-label" title="Game port players connect to"></span>
+            <span id="task-label" class="task hidden"></span>
           </div>
-          <pre id="console" class="console"></pre>
-          <form id="command-form" class="inline-form">
-            <span class="prompt">&gt;</span>
-            <input id="command" placeholder="Server command, e.g. time set day   (↑/↓ history)" autocomplete="off" spellcheck="false">
-            <button class="icon-btn solid" type="submit" title="Send" aria-label="Send command">
-              <svg class="i"><use href="/static/icons.svg#ph-paper-plane-tilt"/></svg>
-            </button>
-          </form>
-        </section>
+        </div>
+        <div class="controls">
+          <label for="countdown" class="muted small-text" title="Chat countdown for players before stop/restart">Countdown</label>
+          <select id="countdown" class="select">
+            <option value="0">Off</option>
+            <option value="10">10 s</option>
+            <option value="30" selected>30 s</option>
+            <option value="60">60 s</option>
+          </select>
+          <button class="btn primary" data-action="start"><svg class="i"><use href="/static/icons.svg#ph-play"/></svg> Start</button>
+          <button class="btn" data-action="restart"><svg class="i"><use href="/static/icons.svg#ph-arrow-clockwise"/></svg> Restart</button>
+          <button class="btn" data-action="stop"><svg class="i"><use href="/static/icons.svg#ph-stop"/></svg> Stop</button>
+          <button class="btn" data-action="backup"><svg class="i"><use href="/static/icons.svg#ph-floppy-disk"/></svg> Backup</button>
+          <button class="btn ghost small hidden" data-action="cancel"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg> Cancel countdown</button>
+          <button class="btn danger small hidden" data-action="kill" title="Kill the Java process (unsaved data is lost)"><svg class="i"><use href="/static/icons.svg#ph-lightning"/></svg> Force kill</button>
+        </div>
+      </header>
 
-        <section class="card chat-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-chat-circle-text"/></svg> Chat</h2>
-          </div>
-          <div id="chat" class="chat"></div>
-          <form id="say-form" class="inline-form">
-            <input id="say" placeholder="Message to all players" autocomplete="off">
-            <button class="icon-btn solid" type="submit" title="Say" aria-label="Send message">
-              <svg class="i"><use href="/static/icons.svg#ph-paper-plane-tilt"/></svg>
-            </button>
-          </form>
-        </section>
+      <div id="eula-banner" class="banner hidden">
+        <svg class="i"><use href="/static/icons.svg#ph-warning"/></svg>
+        <div class="banner-text">
+          <strong>Minecraft EULA not accepted.</strong>
+          The server only starts after you accept the
+          <a href="https://aka.ms/MinecraftEULA" target="_blank" rel="noopener">Minecraft EULA</a>.
+        </div>
+        <button id="eula-accept" class="btn primary small">I accept the EULA</button>
       </div>
 
-      <!-- Column 2: controls, players, system -->
-      <div class="col">
-        <section class="card controls-card">
-          <div class="card-head"><h2><svg class="i"><use href="/static/icons.svg#ph-cube"/></svg> Controls</h2></div>
-          <div class="controls">
-            <button class="btn primary" data-action="start"><svg class="i"><use href="/static/icons.svg#ph-play"/></svg> Start</button>
-            <button class="btn" data-action="restart"><svg class="i"><use href="/static/icons.svg#ph-arrow-clockwise"/></svg> Restart</button>
-            <button class="btn" data-action="stop"><svg class="i"><use href="/static/icons.svg#ph-stop"/></svg> Stop</button>
-            <button class="btn" data-action="backup"><svg class="i"><use href="/static/icons.svg#ph-floppy-disk"/></svg> Backup</button>
+      <!-- ============ Overview ============ -->
+      <section class="page" data-page="overview">
+        <div class="stat-grid">
+          <div class="card stat-card">
+            <div class="stat-top"><span>CPU</span><span id="s-mc-state" class="muted"></span></div>
+            <div id="s-mc-cpu" class="stat-value">–</div>
+            <svg id="spark-cpu" class="spark" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="CPU over the last minutes"><path class="area"/><polyline/></svg>
+            <div class="stat-foot muted">last 3 minutes</div>
           </div>
-          <div class="field-label"><svg class="i"><use href="/static/icons.svg#ph-timer"/></svg> Countdown for players</div>
-          <div class="segmented" role="radiogroup" aria-label="Countdown">
-            <label><input type="radio" name="countdown" value="0"><span>Off</span></label>
-            <label><input type="radio" name="countdown" value="10"><span>10 s</span></label>
-            <label><input type="radio" name="countdown" value="30" checked><span>30 s</span></label>
-            <label><input type="radio" name="countdown" value="60"><span>60 s</span></label>
+          <div class="card stat-card">
+            <div class="stat-top"><span>RAM</span><span id="s-mc-ram-max" class="muted"></span></div>
+            <div id="s-mc-ram" class="stat-value">–</div>
+            <svg id="spark-ram" class="spark ram" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="RAM over the last minutes"><path class="area"/><polyline/></svg>
+            <div class="bar"><div id="b-mc-ram"></div></div>
           </div>
-          <div class="controls secondary">
-            <button class="btn ghost small" data-action="cancel"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg> Cancel countdown</button>
-            <button class="btn danger small" data-action="kill"><svg class="i"><use href="/static/icons.svg#ph-lightning"/></svg> Force kill</button>
+          <div class="card stat-card">
+            <div class="stat-top"><span>Players</span><span id="s-players-max" class="muted"></span></div>
+            <div id="player-count" class="stat-value">0</div>
+            <div id="player-heads" class="heads"></div>
+          </div>
+          <div class="card stat-card">
+            <div class="stat-top"><span>TPS</span><span id="s-mspt" class="muted"></span></div>
+            <div id="s-tps" class="stat-value">–</div>
+            <div class="stat-foot muted" title="Ticks per second: 20 = no lag. Measured only while the panel is open.">20 = no lag</div>
+          </div>
+          <div class="card stat-card">
+            <div class="stat-top"><span>Web panel</span></div>
+            <div id="s-panel" class="stat-value small">–</div>
+            <div id="net-row" class="stat-foot muted hidden" title="Network traffic of this container (Minecraft + panel)">Network ↑/↓ <span id="s-net">–</span></div>
+          </div>
+        </div>
+
+        <section id="history-card" class="card history-card hidden">
+          <div class="card-head"><h2>Last hour</h2><span class="muted small-text">one point every 30 s while the server runs</span></div>
+          <div class="history-grid">
+            <div class="hist"><div class="stat-top"><span>CPU</span><span id="h-cpu" class="muted"></span></div>
+              <svg id="hist-cpu" class="spark" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="CPU in the last hour"><path class="area"/><polyline/></svg></div>
+            <div class="hist"><div class="stat-top"><span>RAM</span><span id="h-ram" class="muted"></span></div>
+              <svg id="hist-ram" class="spark ram" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="RAM in the last hour"><path class="area"/><polyline/></svg></div>
+            <div class="hist"><div class="stat-top"><span>Players</span><span id="h-players" class="muted"></span></div>
+              <svg id="hist-players" class="spark violet" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="Players in the last hour"><path class="area"/><polyline/></svg></div>
+            <div class="hist"><div class="stat-top"><span>TPS</span><span id="h-tps" class="muted"></span></div>
+              <svg id="hist-tps" class="spark warn" viewBox="0 0 240 40" preserveAspectRatio="none" role="img" aria-label="TPS in the last hour"><path class="area"/><polyline/></svg></div>
           </div>
         </section>
 
-        <section class="card players-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-users"/></svg> Players</h2>
-            <span id="player-count" class="count">0</span>
-          </div>
-          <div class="segmented tabs" role="tablist" aria-label="Player lists">
-            <label><input type="radio" name="ptab" value="online" checked><span><svg class="i"><use href="/static/icons.svg#ph-users"/></svg> Online</span></label>
-            <label><input type="radio" name="ptab" value="whitelist"><span><svg class="i"><use href="/static/icons.svg#ph-list-checks"/></svg> Whitelist</span></label>
-            <label><input type="radio" name="ptab" value="ops"><span><svg class="i"><use href="/static/icons.svg#ph-crown-simple"/></svg> OPs</span></label>
+        <div class="overview-grid">
+          <section class="card console-card">
+            <div class="card-head wrap">
+              <h2>Console</h2>
+              <div id="log-filters" class="chips" aria-label="Show lines">
+                <button type="button" class="chip" data-level="info" aria-pressed="true"><span class="dot"></span>Info <span class="n"></span></button>
+                <button type="button" class="chip" data-level="warn" aria-pressed="true"><span class="dot"></span>Warnings <span class="n"></span></button>
+                <button type="button" class="chip" data-level="err" aria-pressed="true"><span class="dot"></span>Errors <span class="n"></span></button>
+                <button type="button" class="chip" data-level="chat" aria-pressed="true"><span class="dot"></span>Chat <span class="n"></span></button>
+                <button type="button" class="chip" data-level="gui" aria-pressed="true"><span class="dot"></span>Panel <span class="n"></span></button>
+              </div>
+              <div class="console-tools">
+                <label for="log-search" class="sr-only">Search the console</label>
+                <input id="log-search" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+                <label class="check" title="Keep the newest line in view">
+                  <input type="checkbox" id="autoscroll" checked>
+                  <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
+                  Follow
+                </label>
+              </div>
+            </div>
+            <pre id="console" class="console" role="log"></pre>
+            <form id="command-form" class="inline-form">
+              <span class="prompt" aria-hidden="true">&gt;</span>
+              <label for="command" class="sr-only">Server command</label>
+              <input id="command" placeholder="Server command, e.g. time set day   (↑/↓ history)" autocomplete="off" spellcheck="false">
+              <button class="btn" type="submit">Send</button>
+            </form>
+          </section>
+
+          <section class="card chat-card">
+            <div class="card-head"><h2>Chat</h2></div>
+            <div id="chat" class="chat"></div>
+            <form id="say-form" class="inline-form">
+              <label for="say" class="sr-only">Message to all players</label>
+              <input id="say" placeholder="Message to all players" autocomplete="off">
+              <button class="btn" type="submit">Say</button>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <!-- ============ Players ============ -->
+      <section class="page hidden players-layout" data-page="players">
+        <div class="card players-card">
+          <div class="tabs" role="tablist" aria-label="Player lists">
+            <button type="button" role="tab" class="tab" data-ptab="online" aria-selected="true">Online <span id="count-online" class="n"></span></button>
+            <button type="button" role="tab" class="tab" data-ptab="whitelist" aria-selected="false">Whitelist <span id="count-whitelist" class="n"></span></button>
+            <button type="button" role="tab" class="tab" data-ptab="ops" aria-selected="false">Operators <span id="count-ops" class="n"></span></button>
+            <button type="button" role="tab" class="tab" data-ptab="bans" aria-selected="false">Banned <span id="count-bans" class="n"></span></button>
           </div>
 
           <div class="tab-panel" data-tab="online">
@@ -125,110 +201,268 @@
           </div>
 
           <div class="tab-panel hidden" data-tab="whitelist">
-            <label class="switch-row check">
+            <label class="check switch-row">
               <input type="checkbox" id="wl-enabled">
               <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
               Whitelist active (only listed players can join)
             </label>
             <form class="inline-form add-form" data-kind="whitelist">
-              <input placeholder="Player name" autocomplete="off" spellcheck="false" maxlength="16">
-              <button class="icon-btn solid" type="submit" title="Add to whitelist" aria-label="Add to whitelist">
-                <svg class="i"><use href="/static/icons.svg#ph-user-plus"/></svg>
-              </button>
+              <label class="sr-only" for="wl-add">Player name</label>
+              <input id="wl-add" placeholder="Player name" autocomplete="off" spellcheck="false" maxlength="16">
+              <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-user-plus"/></svg> Add</button>
             </form>
             <ul id="whitelist" class="list"></ul>
           </div>
 
           <div class="tab-panel hidden" data-tab="ops">
             <form class="inline-form add-form" data-kind="ops">
-              <input placeholder="Player name" autocomplete="off" spellcheck="false" maxlength="16">
-              <button class="icon-btn solid" type="submit" title="Make operator" aria-label="Make operator">
-                <svg class="i"><use href="/static/icons.svg#ph-user-plus"/></svg>
-              </button>
+              <label class="sr-only" for="op-add">Player name</label>
+              <input id="op-add" placeholder="Player name" autocomplete="off" spellcheck="false" maxlength="16">
+              <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-crown-simple"/></svg> Make operator</button>
             </form>
             <ul id="ops" class="list"></ul>
           </div>
-        </section>
 
-        <section class="card datapacks-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-cube"/></svg> Data packs</h2>
-            <label class="btn ghost small" title="Add a data pack (.zip)">
-              <svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> Add
-              <input type="file" id="datapack-file" accept=".zip,application/zip" hidden>
-            </label>
+          <div class="tab-panel hidden" data-tab="bans">
+            <form class="inline-form add-form" data-kind="bans">
+              <label class="sr-only" for="ban-add">Player name</label>
+              <input id="ban-add" placeholder="Player name" autocomplete="off" spellcheck="false" maxlength="16">
+              <label class="sr-only" for="ban-reason">Reason</label>
+              <input id="ban-reason" placeholder="Reason (optional)" autocomplete="off" maxlength="200">
+              <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-prohibit"/></svg> Ban</button>
+            </form>
+            <ul id="bans" class="list"></ul>
           </div>
-          <ul id="datapacks" class="list"></ul>
-        </section>
+        </div>
 
-        <section class="card stats-card">
-          <div class="card-head"><h2><svg class="i"><use href="/static/icons.svg#ph-cpu"/></svg> Resources</h2></div>
-          <div class="stats">
-            <div class="stat-group">Minecraft server <span id="s-mc-state" class="muted"></span></div>
-            <div>
-              <div class="stat"><span>CPU</span><span id="s-mc-cpu">–</span></div>
-              <div class="bar"><div id="b-mc-cpu"></div></div>
-            </div>
-            <div>
-              <div class="stat"><span>RAM</span><span id="s-mc-ram">–</span></div>
-              <div class="bar"><div id="b-mc-ram"></div></div>
-            </div>
-            <div class="stat-group">Web panel</div>
-            <div class="stat"><span>CPU · RAM</span><span id="s-panel">–</span></div>
-            <div id="net-row" class="stat hidden" title="Network traffic of this container (Minecraft + panel)">
-              <span>Network ↑/↓</span><span id="s-net">–</span>
-            </div>
+        <!-- Player profile (next to the lists) -->
+        <aside id="profile-panel" class="card profile-panel" aria-label="Player profile">
+          <div id="pf-empty" class="pf-empty">
+            <svg class="i"><use href="/static/icons.svg#ph-users"/></svg>
+            <p>Click a player to see the profile: play time, position, game mode, teleport, heal, access.</p>
           </div>
-        </section>
-      </div>
-
-      <!-- Column 3: server version, downloaded jars, backups -->
-      <div class="col">
-        <section class="card server-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-scroll"/></svg> Server</h2>
-            <button type="button" id="props-btn" class="btn ghost small" title="Game settings (server.properties)">
-              <svg class="i"><use href="/static/icons.svg#ph-gear-six"/></svg> Game settings
-            </button>
-          </div>
-          <form id="settings-form">
-            <div class="segmented" role="radiogroup" aria-label="Server type">
-              <label><input type="radio" name="flavor" value="paper" checked><span><svg class="i"><use href="/static/icons.svg#ph-lightning"/></svg> Paper</span></label>
-              <label><input type="radio" name="flavor" value="vanilla"><span>Vanilla</span></label>
-            </div>
-
-            <div class="dropdown" id="version-dd">
-              <button type="button" class="dd-toggle" aria-haspopup="listbox" aria-expanded="false">
-                <span class="dd-value">Choose a version</span>
-                <span class="dd-tags"></span>
-                <svg class="i dd-caret"><use href="/static/icons.svg#ph-caret-down"/></svg>
-              </button>
-              <div class="dd-panel hidden">
-                <div class="dd-search">
-                  <svg class="i"><use href="/static/icons.svg#ph-magnifying-glass"/></svg>
-                  <input type="text" placeholder="Search version…" autocomplete="off" spellcheck="false">
+          <div id="pf-body" class="profile hidden">
+            <div class="card-head">
+              <div class="profile-head">
+                <span id="pf-head" class="avatar big" aria-hidden="true"></span>
+                <div>
+                  <h2 id="pf-name"></h2>
+                  <div id="pf-sub" class="muted small-text"></div>
                 </div>
-                <ul class="dd-list" role="listbox"></ul>
+              </div>
+              <button type="button" class="icon-btn small" data-pf-close aria-label="Close profile" title="Close profile"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
+            </div>
+            <dl id="pf-facts" class="facts"></dl>
+            <div id="pf-live" class="profile-live">
+              <div class="label">Game mode</div>
+              <div id="pf-gamemode" class="segmented" role="radiogroup" aria-label="Game mode">
+                <label><input type="radio" name="pf-gm" value="survival"><span>Survival</span></label>
+                <label><input type="radio" name="pf-gm" value="creative"><span>Creative</span></label>
+                <label><input type="radio" name="pf-gm" value="adventure"><span>Adventure</span></label>
+                <label><input type="radio" name="pf-gm" value="spectator"><span>Spectator</span></label>
+              </div>
+              <div class="stack">
+                <button type="button" class="btn small" data-pf="spawn"><svg class="i"><use href="/static/icons.svg#ph-house"/></svg> To spawn</button>
+                <button type="button" class="btn small" data-pf="heal"><svg class="i"><use href="/static/icons.svg#ph-heart"/></svg> Heal</button>
+                <button type="button" class="btn small danger" data-pf="clear"><svg class="i"><use href="/static/icons.svg#ph-trash"/></svg> Clear inventory</button>
+                <button type="button" class="btn small danger" data-pf="kick"><svg class="i"><use href="/static/icons.svg#ph-sign-out"/></svg> Kick</button>
               </div>
             </div>
+            <p id="pf-offline" class="muted small-text hidden">Game mode, teleport, heal and kick work while the player is online.</p>
+            <div class="stack pf-access">
+              <button type="button" class="btn small" data-pf="whitelist"></button>
+              <button type="button" class="btn small" data-pf="op"></button>
+              <button type="button" class="btn small danger" data-pf="ban"></button>
+            </div>
+          </div>
+        </aside>
+      </section>
 
-            <label class="check">
-              <input type="checkbox" id="snapshots">
-              <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
-              Include snapshots &amp; pre-releases
+      <!-- ============ Add-ons (data packs) ============ -->
+      <section class="page hidden" data-page="addons">
+        <div class="tabs addon-tabs" role="tablist" aria-label="Add-on types">
+          <button type="button" role="tab" class="tab" data-atab="datapacks" aria-selected="true">Data packs</button>
+          <button type="button" role="tab" class="tab" data-atab="jars" aria-selected="false"><span id="jars-tab-label">Mods</span> <span id="count-jars" class="n"></span></button>
+        </div>
+
+        <div id="jars-panel" class="hidden">
+          <div id="vanilla-note" class="hint-box info hidden">
+            <svg class="i"><use href="/static/icons.svg#ph-info"/></svg>
+            <div class="hint-text"><p>Vanilla runs no mods or plugins. Switch the server type on the
+              <a href="#" data-goto="server">Server page</a>: <b>Paper</b> for plugins (server-side only, players
+              join with normal Minecraft) or <b>Fabric</b> for mods (new blocks and mobs need the mod on the players' side too).</p></div>
+          </div>
+          <div id="jars-content" class="two-col">
+            <section class="card grow-card">
+              <div class="card-head">
+                <h2 id="jars-title">Mods</h2>
+                <span class="row-actions">
+                  <span id="jars-note" class="muted small-text"></span>
+                  <button type="button" id="jars-updates" class="btn small"><svg class="i"><use href="/static/icons.svg#ph-arrow-clockwise"/></svg> Check for updates</button>
+                </span>
+              </div>
+              <ul id="jars" class="list roomy"></ul>
+            </section>
+            <section class="card side-card">
+              <div class="card-head"><h2>Find on Modrinth</h2></div>
+              <form id="mr-form" class="inline-form">
+                <label for="mr-query" class="sr-only">Search Modrinth</label>
+                <input id="mr-query" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+                <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-magnifying-glass"/></svg></button>
+              </form>
+              <p id="mr-note" class="muted small-text"></p>
+              <ul id="mr-results" class="list mr-list"></ul>
+              <label class="dropzone" for="jar-file">
+                <svg class="i big"><use href="/static/icons.svg#ph-download-simple"/></svg>
+                <strong>Upload .jar</strong>
+                <span id="jar-drop-note" class="muted small-text">from another source</span>
+                <input type="file" id="jar-file" accept=".jar,application/java-archive" class="sr-only">
+              </label>
+            </section>
+          </div>
+        </div>
+
+        <div id="datapacks-panel" class="two-col">
+          <section class="card grow-card">
+            <div class="card-head">
+              <h2>Data packs in this world</h2>
+              <span class="muted small-text">switching applies live while the server runs</span>
+            </div>
+            <ul id="datapacks" class="list roomy"></ul>
+          </section>
+          <section class="card side-card">
+            <div class="card-head"><h2>Add a data pack</h2></div>
+            <label class="dropzone" for="datapack-file">
+              <svg class="i big"><use href="/static/icons.svg#ph-download-simple"/></svg>
+              <strong>Upload .zip</strong>
+              <span class="muted small-text">kept in the library (shared by all servers) and installed into this world</span>
+              <input type="file" id="datapack-file" accept=".zip,application/zip" class="sr-only">
             </label>
-            <div class="map-row">
+            <p id="addon-note" class="muted small-text"></p>
+          </section>
+        </div>
+      </section>
+
+      <!-- ============ World & backups ============ -->
+      <section class="page hidden" data-page="world">
+        <div class="two-col">
+          <section class="card grow-card">
+            <div class="card-head">
+              <h2>Backups</h2>
+              <span id="backup-keep" class="muted small-text"></span>
+            </div>
+            <ul id="backups" class="list"></ul>
+          </section>
+          <section class="card side-card">
+            <div class="card-head"><h2>World</h2></div>
+            <dl class="facts">
+              <div><dt>Last played with</dt><dd id="world-version">–</dd></div>
+            </dl>
+            <div class="stack">
+              <button type="button" id="props-btn" class="btn">
+                <svg class="i"><use href="/static/icons.svg#ph-gear-six"/></svg> Game settings
+              </button>
+              <button type="button" id="rules-btn" class="btn">
+                <svg class="i"><use href="/static/icons.svg#ph-sliders"/></svg> Game rules
+              </button>
+              <button type="button" id="new-world-btn" class="btn">
+                <svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> New world…
+              </button>
+              <label class="btn" for="world-file" title="A world as .zip (from another server or single-player). It is added as a backup you can restore.">
+                <svg class="i"><use href="/static/icons.svg#ph-upload-simple"/></svg> Upload world…
+                <input type="file" id="world-file" accept=".zip,application/zip" class="sr-only">
+              </label>
+            </div>
+            <div id="map-box" class="map-box">
               <label class="check" id="map-option">
                 <input type="checkbox" id="map-enabled">
                 <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
                 <span>Live map</span>
               </label>
+              <span class="grow"></span>
               <a id="map-open" class="btn ghost small hidden" target="_blank" rel="noopener" title="Open the live map (shareable link)">
-                <svg class="i"><use href="/static/icons.svg#ph-map-trifold"/></svg> Open map
+                <svg class="i"><use href="/static/icons.svg#ph-map-trifold"/></svg> Open
               </a>
               <button type="button" id="map-render" class="icon-btn small hidden" title="Update the map now (saves the world first if the server runs)" aria-label="Update map now">
                 <svg class="i"><use href="/static/icons.svg#ph-arrow-clockwise"/></svg>
               </button>
+            </div>
+            <form id="cave-form" class="cave-form hidden">
+              <label for="cave-reach">Caves visible up to (blocks from the opening)</label>
+              <div class="inline-form">
+                <input id="cave-reach" type="number" min="0" max="256" step="1" required>
+                <button class="btn small" type="submit">Save</button>
+              </div>
+              <p class="muted small-text">In 3D, caves are only shown as far as they are open to the sky,
+                so the map gives nobody an advantage. 0 = only the openings. Saving re-renders the map.</p>
+              <label class="check">
+                <input type="checkbox" id="all-caves">
+                <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
+                <span>Show all caves with the height cut <span class="muted">(reveals hidden caves)</span></span>
+              </label>
+            </form>
+            <p id="map-note" class="muted small-text"></p>
+          </section>
+        </div>
+      </section>
+
+      <!-- ============ Server ============ -->
+      <section class="page hidden" data-page="server">
+        <section class="card">
+          <form id="settings-form" class="settings-form">
+            <div class="card-head"><h2>Server type</h2></div>
+            <div class="type-cards" role="radiogroup" aria-label="Server type">
+              <label class="type-card">
+                <input type="radio" name="flavor" value="vanilla">
+                <span class="type-body">
+                  <span class="type-title">Vanilla <span class="tag">Simple</span></span>
+                  <span class="type-desc">Pure Minecraft from Mojang.</span>
+                  <span class="type-foot muted">Data packs</span>
+                </span>
+              </label>
+              <label class="type-card">
+                <input type="radio" name="flavor" value="paper" checked>
+                <span class="type-body">
+                  <span class="type-title">Paper <span class="tag accent">Recommended</span></span>
+                  <span class="type-desc">Faster, fixes lag, same gameplay.</span>
+                  <span class="type-foot muted">Data packs + plugins</span>
+                </span>
+              </label>
+              <label class="type-card">
+                <input type="radio" name="flavor" value="fabric">
+                <span class="type-body">
+                  <span class="type-title">Fabric <span class="tag violet">Mods</span></span>
+                  <span class="type-desc">For mods: new blocks, mobs, tech.</span>
+                  <span class="type-foot muted">Data packs + mods</span>
+                </span>
+              </label>
+            </div>
+
+            <div class="form-grid">
+              <div class="field wide">
+                <span class="label" id="version-label-text">Minecraft version</span>
+                <div class="dropdown" id="version-dd">
+                  <button type="button" class="dd-toggle" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="version-label-text">
+                    <span class="dd-value">Choose a version</span>
+                    <span class="dd-tags"></span>
+                    <svg class="i dd-caret"><use href="/static/icons.svg#ph-caret-down"/></svg>
+                  </button>
+                  <div class="dd-panel hidden">
+                    <div class="dd-search">
+                      <svg class="i"><use href="/static/icons.svg#ph-magnifying-glass"/></svg>
+                      <input type="text" placeholder="Search version…" autocomplete="off" spellcheck="false" aria-label="Search version">
+                    </div>
+                    <ul class="dd-list" role="listbox"></ul>
+                  </div>
+                </div>
+                <label class="check">
+                  <input type="checkbox" id="snapshots">
+                  <span class="box"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg></span>
+                  Include snapshots &amp; pre-releases
+                </label>
+              </div>
+              <div class="field"><label for="min-ram">Min RAM</label><input id="min-ram" placeholder="1G"></div>
+              <div class="field"><label for="max-ram">Max RAM</label><input id="max-ram" placeholder="3G"></div>
             </div>
 
             <div id="version-hint" class="hint-box hidden">
@@ -236,56 +470,106 @@
               <div class="hint-text"></div>
             </div>
 
-            <div class="ram-row">
-              <div><label for="min-ram">Min RAM</label><input id="min-ram" placeholder="1G"></div>
-              <div><label for="max-ram">Max RAM</label><input id="max-ram" placeholder="3G"></div>
+            <div class="row-buttons">
               <button class="btn primary" type="submit"><svg class="i"><use href="/static/icons.svg#ph-check"/></svg> Save</button>
-              <button class="icon-btn" type="button" id="install-btn" title="Download now (without starting)" aria-label="Download now">
-                <svg class="i"><use href="/static/icons.svg#ph-download-simple"/></svg>
+              <button class="btn" type="button" id="install-btn" title="Download now (without starting)">
+                <svg class="i"><use href="/static/icons.svg#ph-download-simple"/></svg> Download now
               </button>
             </div>
           </form>
         </section>
 
-        <section class="card installed-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-hard-drives"/></svg> Downloaded servers</h2>
-            <span id="java-list" class="muted small-text"></span>
-          </div>
-          <ul id="installed" class="list"></ul>
-        </section>
-
-        <section class="card backups-card">
-          <div class="card-head">
-            <h2><svg class="i"><use href="/static/icons.svg#ph-archive"/></svg> Backups</h2>
-            <span id="backup-keep" class="muted small-text"></span>
-            <button type="button" id="new-world-btn" class="btn ghost small" title="Archive the current world and start a new one">
-              <svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> New world
+        <div class="two-col">
+          <section class="card grow-card">
+            <div class="card-head">
+              <h2>Downloaded servers</h2>
+              <span id="java-list" class="muted small-text"></span>
+            </div>
+            <p class="muted small-text">Shared by all servers of this panel.</p>
+            <ul id="installed" class="list"></ul>
+          </section>
+          <section class="card side-card">
+            <div class="card-head"><h2>This server</h2></div>
+            <form id="rename-form" class="inline-form">
+              <label for="server-rename" class="sr-only">Server name</label>
+              <input id="server-rename" maxlength="40" autocomplete="off">
+              <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-pencil"/></svg> Rename</button>
+            </form>
+            <dl class="facts">
+              <div><dt>Game port</dt><dd id="fact-port">–</dd></div>
+              <div><dt>Folder</dt><dd id="fact-id">–</dd></div>
+            </dl>
+            <div class="icon-row">
+              <img id="server-icon-img" class="server-icon-preview" width="64" height="64" alt="Server list icon">
+              <div class="grow">
+                <div class="label">Icon in the server list</div>
+                <p class="muted small-text">Shown next to the server in Minecraft's multiplayer list. Any image,
+                  cut to a square and scaled to 64×64. Shows after the next restart.</p>
+                <div class="stack">
+                  <label class="btn small" for="server-icon-file"><svg class="i"><use href="/static/icons.svg#ph-upload-simple"/></svg> Upload image…</label>
+                  <input type="file" id="server-icon-file" accept="image/*" class="sr-only">
+                  <button type="button" id="server-icon-reset" class="btn small">Use panel logo</button>
+                </div>
+              </div>
+            </div>
+            <button type="button" id="delete-server-btn" class="btn danger small hidden">
+              <svg class="i"><use href="/static/icons.svg#ph-trash"/></svg> Delete this server…
             </button>
-          </div>
-          <ul id="backups" class="list"></ul>
-        </section>
-      </div>
+          </section>
+        </div>
+      </section>
     </main>
   </div>
+
+  <!-- New server -->
+  <dialog id="server-dialog" class="dialog">
+    <form id="server-form" method="dialog">
+      <div class="card-head">
+        <h2>New server</h2>
+        <button type="button" class="icon-btn small" data-close aria-label="Close"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
+      </div>
+      <p class="muted small-text">A second, completely separate server: own world, settings, players, backups and game port.
+        Jars and data pack library are shared.</p>
+      <div class="field"><label for="ns-name">Name</label><input id="ns-name" maxlength="40" required placeholder="e.g. Creative or Modded" autocomplete="off"></div>
+      <div class="field">
+        <span class="label">Type</span>
+        <div class="segmented" role="radiogroup" aria-label="Server type">
+          <label><input type="radio" name="ns-flavor" value="paper" checked><span>Paper</span></label>
+          <label><input type="radio" name="ns-flavor" value="vanilla"><span>Vanilla</span></label>
+          <label><input type="radio" name="ns-flavor" value="fabric"><span>Fabric</span></label>
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="field wide"><label for="ns-version">Version</label><select id="ns-version" class="select"></select></div>
+        <div class="field"><label for="ns-min">Min RAM</label><input id="ns-min" value="1G"></div>
+        <div class="field"><label for="ns-max">Max RAM</label><input id="ns-max" value="2G"></div>
+      </div>
+      <p class="muted small-text">Both servers can run at the same time: make sure the machine has enough RAM for both.</p>
+      <div class="dialog-actions">
+        <span></span>
+        <button type="button" class="btn ghost" data-close>Cancel</button>
+        <button type="submit" class="btn primary"><svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> Create server</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Game settings (server.properties) -->
   <dialog id="props-dialog" class="dialog">
     <form id="props-form" method="dialog">
       <div class="card-head">
-        <h2><svg class="i"><use href="/static/icons.svg#ph-gear-six"/></svg> Game settings</h2>
+        <h2>Game settings</h2>
         <button type="button" class="icon-btn small" data-close aria-label="Close"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
       </div>
       <div class="props-grid">
         <div class="full"><label for="p-motd">Server name in the server list (MOTD)</label><input id="p-motd" data-key="motd" maxlength="120"></div>
-        <div class="full"><div class="field-label">Difficulty</div>
+        <div class="full"><div class="label">Difficulty</div>
           <div class="segmented" data-key="difficulty">
             <label><input type="radio" name="p-difficulty" value="peaceful"><span>Peaceful</span></label>
             <label><input type="radio" name="p-difficulty" value="easy"><span>Easy</span></label>
             <label><input type="radio" name="p-difficulty" value="normal"><span>Normal</span></label>
             <label><input type="radio" name="p-difficulty" value="hard"><span>Hard</span></label>
           </div></div>
-        <div class="full"><div class="field-label">Default game mode</div>
+        <div class="full"><div class="label">Default game mode</div>
           <div class="segmented" data-key="gamemode">
             <label><input type="radio" name="p-gamemode" value="survival"><span>Survival</span></label>
             <label><input type="radio" name="p-gamemode" value="creative"><span>Creative</span></label>
@@ -312,24 +596,18 @@
   <dialog id="world-dialog" class="dialog">
     <form id="world-form" method="dialog">
       <div class="card-head">
-        <h2><svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> New world</h2>
+        <h2>New world</h2>
         <button type="button" class="icon-btn small" data-close aria-label="Close"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
       </div>
       <p>The current world is packed into the backup folder as an <strong>archive</strong>. Archives are
         never deleted automatically and can be restored or downloaded anytime.</p>
-      <p class="muted small-text">The live map is reset. The new world is generated on the next start.</p>
+      <p class="muted small-text" id="world-map-note">The live map is reset. The new world is generated on the next start.</p>
       <label for="world-seed">Seed <span class="muted">(optional, empty = random)</span></label>
       <input id="world-seed" maxlength="64" autocomplete="off" spellcheck="false" placeholder="e.g. 8472910384 or any text">
       <div id="world-packs-wrap" class="hidden">
-        <label>Data packs <span class="muted">(in place before the world is generated)</span></label>
+        <div class="label">Data packs <span class="muted">(in place before the world is generated)</span></div>
         <div id="world-packs" class="pack-checks"></div>
       </div>
-      <details id="world-exp-wrap" class="experiments">
-        <summary>Experiments <span class="muted">(upcoming features, only when a world is created)</span></summary>
-        <p class="muted small-text">Like "Experiments" in singleplayer. They cannot be switched off later and
-          may cause problems with future versions — best for test worlds.</p>
-        <div id="world-exp" class="pack-checks"></div>
-      </details>
       <div class="dialog-actions">
         <span></span>
         <button type="button" class="btn ghost" data-close>Cancel</button>
@@ -338,7 +616,22 @@
     </form>
   </dialog>
 
-  <div id="toast" class="toast hidden"></div>
+
+  <!-- Game rules -->
+  <dialog id="rules-dialog" class="dialog wide">
+    <div class="rules">
+      <div class="card-head">
+        <h2>Game rules</h2>
+        <button type="button" class="icon-btn small" data-close aria-label="Close"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
+      </div>
+      <p id="rules-note" class="muted small-text"></p>
+      <label for="rules-search" class="sr-only">Search game rules</label>
+      <input id="rules-search" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+      <div id="rules-list" class="rules-list"></div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

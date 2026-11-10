@@ -9,12 +9,14 @@ Die Live-Map hat eigene Listen: [TODO_LIVEMAP.md](TODO_LIVEMAP.md), [DEV_TODO_LI
 `app/config.py`, `Dockerfile`, `docker-compose*.yml`, `README.md`, `CLAUDE.md`) nur gezielt und klein
 ändern und direkt vorher neu lesen – dort arbeitet evtl. gleichzeitig die Live-Map-Seite.
 
-## Ideen für später (viel später – erst wenn Vanilla mit Datapacks rund läuft)
+**Ziel-Design:** Variante A aus dem Mockup https://claude.ai/artifact/JfZwYapBDq9HBfbEJUZvZk
+(Seitenleiste mit Server-Umschalter, Seiten Übersicht / Spieler / Add-ons / Welt & Backups / Server,
+Skin-Köpfe). Mehrere Server, das neue Frontend sowie Phase 3 und 4 (Fabric, Mods/Plugins, Bannliste,
+Spielerprofile, Verlauf/TPS, Gamerules, Welt-Upload, Höhlen-Einstellungen) sind fertig (siehe CLAUDE.md).
 
-- [ ] Fabric als dritte Server-Variante
-  - Approach: `FLAVORS` um `"fabric"` erweitern. Versionsliste aus der Fabric-Meta-API (`https://meta.fabricmc.net/v2/versions/game` für Spielversionen, `/v2/versions/loader/<game>` für den neuesten stabilen Loader, `/v2/versions/installer`). Server-Jar: `/v2/versions/loader/<game>/<loader>/<installer>/server/jar` (Launcher, lädt beim ersten Start Vanilla-Jar + Libraries nach `server/`). Fabric liefert keine Prüfsumme: nur Größe/ZIP-Gültigkeit prüfen. Sidecar-JSON: `java` aus Mojangs Version-JSON, `build` = Loader-Version. Frontend: dritte Option im Server-Typ-Auswahlfeld, Tag-Farbe, Texte so, dass Paper als Empfehlung für Vanilla-Spiele und Fabric für Mods erscheint. Paper-Update-Button analog für den Fabric-Loader.
-  - Touches: `app/versions.py`, `app/main.py`, `app/static/app.js`, `app/static/index.html`, `tests/`
+## Offen
 
-- [ ] Mod-Verwaltung für Fabric
-  - Approach: Neues Modul `app/mods.py` für `server/mods/`: Liste (Dateiname, Größe, aus `fabric.mod.json` im Jar: id, Name, Version, `depends.minecraft`), Hochladen von `.jar` (Dateiname validieren, kein Pfad), Löschen, Aktivieren/Deaktivieren per Umbenennung in `.jar.disabled`. Änderungen nur bei gestopptem Server (sonst 409, wie bei Restore). Fabric API als Hinweis anbieten, weil fast alle Mods sie brauchen. Neue Karte "Mods" im Panel, nur sichtbar bei Flavor `fabric`. Später optional: Suche/Download über die Modrinth-API (`api.modrinth.com/v2`, gefiltert nach `loaders=fabric` und Spielversion, mit SHA-512-Prüfung).
-  - Touches: `app/mods.py` (neu), `app/main.py`, `app/static/app.js`, `app/static/index.html`, `app/static/style.css`, `tests/test_mods.py`
+- [ ] Eigene Datapacks: Quellordner im Repo (optional)
+  - Entscheidung 2026-11-10: Kein Editor im Panel. Datapacks schreibt der Entwickler zusammen mit Claude; im Panel sollen sie wie die anderen Packs installier- und umschaltbar sein. Das geht schon: ein Ordner-Pack (mit `pack.mcmeta`) in `DATA_DIR/datapacks/<name>/` erscheint in der Bibliothek, „Install“/Ein/Aus wie gewohnt, nach Änderungen zeigt das Panel „outdated“ → Update (+ `/reload` beim Umschalten).
+  - Offen: `data/` ist in `.gitignore`, eigene Packs wären also nicht versioniert. Vorschlag: Quellen in `datapacks/` im Repo, das Panel liest diesen Ordner als zweite Bibliotheksquelle (z. B. `DATAPACK_SRC`, im Docker-Compose read-only gemountet) oder ein kleines Sync-Skript kopiert sie nach `DATA_DIR/datapacks/`. Erst umsetzen, wenn das erste eigene Pack entsteht.
+  - Touches: `app/datapacks.py`, `app/config.py`, `docker-compose*.yml`, README

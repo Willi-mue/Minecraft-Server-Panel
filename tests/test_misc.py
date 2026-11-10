@@ -6,6 +6,7 @@ import uuid
 import pytest
 
 from app import access, config, java, livemap, properties, world
+from app.instances import MAIN
 
 
 # ---------- config ----------
@@ -61,20 +62,20 @@ def test_offline_uuid_matches_java():
 def test_properties_roundtrip_keeps_other_lines(data):
     p = config.SERVER_DIR / "server.properties"
     p.write_text("#comment\nmotd=Hi\nonline-mode=true\n")
-    access.set_property("online-mode", "false")
-    access.set_property("white-list", "true")
+    access.set_property(MAIN, "online-mode", "false")
+    access.set_property(MAIN, "white-list", "true")
     assert p.read_text().splitlines() == ["#comment", "motd=Hi", "online-mode=false", "white-list=true"]
-    assert access.get_property("motd") == "Hi"
+    assert access.get_property(MAIN, "motd") == "Hi"
 
 
 def test_offline_whitelist_add_remove(data):
-    access.set_property("online-mode", "false")  # no network lookup
-    access.offline_change("whitelist", "add", "Steve")
+    access.set_property(MAIN, "online-mode", "false")  # no network lookup
+    access.offline_change(MAIN, "whitelist", "add", "Steve")
     with pytest.raises(LookupError):
-        access.offline_change("whitelist", "add", "steve")
-    assert access.state()["whitelist"] == ["Steve"]
-    access.offline_change("whitelist", "remove", "STEVE")
-    assert access.state()["whitelist"] == []
+        access.offline_change(MAIN, "whitelist", "add", "steve")
+    assert access.state(MAIN)["whitelist"] == ["Steve"]
+    access.offline_change(MAIN, "whitelist", "remove", "STEVE")
+    assert access.state(MAIN)["whitelist"] == []
 
 
 @pytest.mark.parametrize("name", ["ab", "a" * 17, "a;op x", "a b"])
@@ -86,12 +87,12 @@ def test_invalid_player_names(name):
 # ---------- server.properties editor ----------
 
 def test_properties_validation(data):
-    assert properties.update({"view-distance": 6, "difficulty": "hard", "allow-flight": True})["view-distance"] == 6
+    assert properties.update(MAIN, {"view-distance": 6, "difficulty": "hard", "allow-flight": True})["view-distance"] == 6
     for bad in ({"view-distance": 99}, {"difficulty": "extreme"}, {"motd": "a\nb"}, {"online-mode": False},
                 {"max-players": True}):
         with pytest.raises(ValueError):
-            properties.update(bad)
-    assert properties.get_all()["difficulty"] == "hard"
+            properties.update(MAIN, bad)
+    assert properties.get_all(MAIN)["difficulty"] == "hard"
 
 
 # ---------- world version from level.dat ----------
@@ -113,15 +114,15 @@ def _level_dat(version_name):
 
 def test_world_version_from_level_dat(data):
     (config.SERVER_DIR / "world").mkdir()
-    world.level_dat().write_bytes(_level_dat("1.21.4"))
-    assert world.saved_version() == "1.21.4"
+    world.level_dat(MAIN).write_bytes(_level_dat("1.21.4"))
+    assert world.saved_version(MAIN) == "1.21.4"
 
 
 def test_world_version_missing_or_broken(data):
-    assert world.saved_version() is None
+    assert world.saved_version(MAIN) is None
     (config.SERVER_DIR / "world").mkdir()
-    world.level_dat().write_bytes(b"not gzip")
-    assert world.saved_version() is None
+    world.level_dat(MAIN).write_bytes(b"not gzip")
+    assert world.saved_version(MAIN) is None
 
 
 # ---------- live map ----------
@@ -164,6 +165,54 @@ def test_world_args_include_old_paper_dimension_folders(data):
     args = livemap._world_args()
     assert args[:2] == ["--world", str(config.SERVER_DIR / "world")]
     assert args[2:] == ["--extra", str(config.SERVER_DIR / "world_nether")]
+
+
+def test_map_visibility_defaults_validation_and_args(data):
+    default = {"cave_reach": livemap.CAVE_REACH_DEFAULT, "all_caves": livemap.ALL_CAVES_DEFAULT}
+    assert livemap.load_visibility() == default
+    assert livemap.save_visibility({"cave_reach": 16, "all_caves": False}) == {"cave_reach": 16, "all_caves": False}
+    assert livemap.load_visibility() == {"cave_reach": 16, "all_caves": False}
+    assert livemap._visibility_args() == ["--cave-reach", "16"]
+    # keys left out keep their stored value
+    assert livemap.save_visibility({"all_caves": True}) == {"cave_reach": 16, "all_caves": True}
+    assert livemap._visibility_args() == ["--cave-reach", "16", "--all-caves"]
+    for bad in ({"cave_reach": -1}, {"cave_reach": "32"}, {"cave_reach": 1000}, {"cave_reach": 2.5}, {"all_caves": "yes"}):
+        with pytest.raises(ValueError):
+            livemap.validate_visibility(bad)
+    # a broken file falls back to the defaults
+    (data / "map_visibility.json").write_text("{nope", encoding="utf-8")
+    assert livemap.load_visibility() == default
+
+
+def test_skin_url_only_from_mojang():
+    import base64
+
+    def profile(url):
+        value = base64.b64encode(json.dumps({"textures": {"SKIN": {"url": url}}}).encode()).decode()
+        return {"properties": [{"name": "textures", "value": value}]}
+
+    assert livemap._skin_url(profile("http://textures.minecraft.net/texture/abc")) == "https://textures.minecraft.net/texture/abc"
+    assert livemap._skin_url(profile("https://evil.example/texture/abc")) is None
+    assert livemap._skin_url(profile("file:///etc/passwd")) is None
+    assert livemap._skin_url({}) is None
+
+
+def test_skin_paths_and_player_uuids(data):
+    with pytest.raises(ValueError):
+        livemap.skin_path("../../x")
+    (config.SERVER_DIR / "usercache.json").write_text(json.dumps(
+        [{"name": "Steve", "uuid": "c2c64826-10bf-428e-9097-606bda04cd1d", "expiresOn": "x"}]), encoding="utf-8")
+    skins = livemap.Skins()
+    assert skins.uuid_of("steve") == "c2c6482610bf428e9097606bda04cd1d"
+    assert skins.uuid_of("Alex") is None
+    # the snapshot names the skin once it is downloaded
+    t = livemap.PlayerTracker()
+    t.positions["Steve"] = {"name": "Steve", "dimension": "minecraft:overworld", "x": 1.0, "y": 2.0, "z": 3.0}
+    assert "skin" not in t.snapshot()[0]
+    path = livemap.skin_path("c2c6482610bf428e9097606bda04cd1d")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"png")
+    assert t.snapshot()[0]["skin"] == "c2c6482610bf428e9097606bda04cd1d"
 
 
 def _set_versions(world: str, server: str = "") -> None:

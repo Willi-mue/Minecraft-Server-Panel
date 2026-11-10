@@ -53,7 +53,7 @@ ENV HOME=/home/minecraft \
     PYTHONDONTWRITEBYTECODE=1
 
 VOLUME /data
-EXPOSE 47318 47319 25565
+EXPOSE 47318 47319 25565-25569
 
 # Panel alive? (checks the web app only; a stopped Minecraft server is a normal state)
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \

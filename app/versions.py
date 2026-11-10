@@ -1,26 +1,38 @@
-"""Server jars: Vanilla (Mojang) and Paper (PaperMC Fill API v3).
+"""Server jars: Vanilla (Mojang), Paper (PaperMC Fill API v3) and Fabric (Fabric meta API).
 
 Jars are stored as `<JARS_DIR>/<flavor>-<version>.jar` with a sidecar
 `<flavor>-<version>.json` holding the required Java version, build and JVM flags.
+The Fabric jar is Fabric's server launcher: on its first start it downloads the Vanilla server
+and the loader libraries into the server folder itself. Its `build` is the loader version.
 """
 
 import hashlib
 import json
+import re
 import shutil
+import threading
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 from . import config
 
 MOJANG_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
+FABRIC_API = "https://meta.fabricmc.net/v2"
 # PaperMC asks API clients to identify themselves with a descriptive User-Agent
 USER_AGENT = "minecraft-server-panel/1.0 (self-hosted server panel)"
-FLAVORS = ("vanilla", "paper")
+FLAVORS = ("vanilla", "paper", "fabric")
+# Loader/installer versions from Fabric's API go into a URL: keep them plain
+_FABRIC_VER_RE = re.compile(r"^[0-9A-Za-z.+\-]{1,40}$")
+FABRIC_MAX_JAR = 64 * 2**20
 _CACHE_TTL = 600
 
 _cache: dict[str, tuple[float, object]] = {}
+# JARS_DIR is shared by all servers: one download/update at a time (same .part file otherwise)
+_download_lock = threading.Lock()
 
 
 def _get_json(url: str):
@@ -73,6 +85,15 @@ def list_versions(flavor: str, include_snapshots: bool = False) -> dict:
             if v["type"] == "release" or (include_snapshots and v["type"] == "snapshot")
         ]
         return {"latest": m["latest"]["release"], "versions": versions}
+
+    if flavor == "fabric":
+        versions = [
+            {"id": v["version"], "snapshot": not v.get("stable"), "rank": ranks.get(v["version"])}
+            for v in _cached(f"{FABRIC_API}/versions/game")
+            if v.get("stable") or include_snapshots
+        ]
+        latest = next((v["id"] for v in versions if not v["snapshot"]), None)
+        return {"latest": latest, "versions": versions}
 
     project = _cached(PAPER_API)
     ids = [v for group in project["versions"].values() for v in group]
@@ -149,13 +170,14 @@ def _ignored() -> set[str]:
         return set()
 
 
-def delete(flavor: str, version_id: str) -> None:
+def delete(flavor: str, version_id: str, server_dirs=()) -> None:
+    """server_dirs: the servers' folders, to remember jars that came from a Paper cache."""
     jar = jar_path(flavor, version_id)
     if not jar.exists():
         raise FileNotFoundError(f"{flavor} {version_id} is not downloaded")
     jar.unlink()
     meta_path(flavor, version_id).unlink(missing_ok=True)
-    if flavor == "vanilla" and (config.SERVER_DIR / "cache" / f"mojang_{version_id}.jar").exists():
+    if flavor == "vanilla" and any((d / "cache" / f"mojang_{version_id}.jar").exists() for d in server_dirs):
         # Don't re-import it from Paper's cache after the user deleted it
         _ignored_file().write_text(json.dumps(sorted(_ignored() | {version_id})))
 
@@ -223,6 +245,11 @@ def _download_paper(version_id: str, log) -> dict:
 
 def update_paper(version_id: str, log=print) -> bool:
     """Replace a downloaded Paper jar with the newest build. Returns True if it was replaced."""
+    with _download_lock:
+        return _update_paper(version_id, log)
+
+
+def _update_paper(version_id: str, log) -> bool:
     jar = jar_path("paper", version_id)
     if not jar.exists():
         raise FileNotFoundError(f"Paper {version_id} is not downloaded")
@@ -242,6 +269,101 @@ def update_paper(version_id: str, log=print) -> bool:
     return True
 
 
+# ---------- Fabric ----------
+
+
+def _mojang_java(version_id: str) -> int:
+    """Java major Mojang's version JSON asks for (8 if unknown)."""
+    entry = next((v for v in _cached(MOJANG_MANIFEST)["versions"] if v["id"] == version_id), None)
+    if entry is None:
+        return 8
+    return _get_json(entry["url"]).get("javaVersion", {}).get("majorVersion", 8)
+
+
+def _newest_stable(entries: list, key=lambda e: e) -> str:
+    """First stable entry (Fabric's lists are newest first), else the first one."""
+    if not entries:
+        raise ValueError("Fabric's API returned no versions")
+    pick = next((e for e in entries if key(e).get("stable")), entries[0])
+    version = key(pick)["version"]
+    if not _FABRIC_VER_RE.match(version):
+        raise ValueError(f"Unexpected Fabric version id: {version}")
+    return version
+
+
+def fabric_loader(version_id: str) -> str:
+    """Newest stable Fabric loader for this Minecraft version."""
+    loaders = _get_json(f"{FABRIC_API}/versions/loader/{urllib.parse.quote(version_id)}")
+    if not loaders:
+        raise ValueError(f"Fabric doesn't support Minecraft {version_id}")
+    return _newest_stable(loaders, lambda e: e["loader"])
+
+
+def _fetch_zip(url: str, target: Path) -> None:
+    """Fabric publishes no checksum for the launcher jar: check size and that it is a jar (zip)."""
+    tmp = target.with_name(target.name + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+            size = 0
+            while chunk := resp.read(1 << 16):
+                size += len(chunk)
+                if size > FABRIC_MAX_JAR:
+                    raise ValueError("Download too large, discarded")
+                f.write(chunk)
+        try:
+            with zipfile.ZipFile(tmp) as zf:
+                if zf.testzip() is not None or "META-INF/MANIFEST.MF" not in zf.namelist():
+                    raise ValueError("Downloaded Fabric launcher is not a valid jar")
+        except zipfile.BadZipFile:
+            raise ValueError("Downloaded Fabric launcher is not a valid jar") from None
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _fetch_fabric(version_id: str, loader: str, log) -> dict:
+    installer = _newest_stable(_get_json(f"{FABRIC_API}/versions/installer"))
+    log(f"Downloading Fabric {version_id} (loader {loader}) ...")
+    url = (f"{FABRIC_API}/versions/loader/{urllib.parse.quote(version_id)}/{loader}/{installer}/server/jar")
+    _fetch_zip(url, jar_path("fabric", version_id))
+    return {"java": _mojang_java(version_id), "build": loader, "installer": installer}
+
+
+def _download_fabric(version_id: str, log) -> dict:
+    return _fetch_fabric(version_id, fabric_loader(version_id), log)
+
+
+def update_fabric(version_id: str, log=print) -> bool:
+    """Switch a downloaded Fabric server to the newest stable loader. True if it was replaced."""
+    with _download_lock:
+        jar = jar_path("fabric", version_id)
+        if not jar.exists():
+            raise FileNotFoundError(f"Fabric {version_id} is not downloaded")
+        current = meta("fabric", version_id).get("build")
+        loader = fabric_loader(version_id)
+        if loader == current:
+            log(f"Fabric {version_id} is up to date (loader {current}).")
+            return False
+        try:
+            new_meta = _fetch_fabric(version_id, loader, log)
+        except PermissionError as e:
+            raise RuntimeError("The jar is in use: stop the server first, then update") from e
+        meta_path("fabric", version_id).write_text(json.dumps(new_meta))
+        log(f"Fabric {version_id} updated to loader {loader}" + (f" (was {current})" if current else "")
+            + ". Takes effect on the next server start.")
+        return True
+
+
+def update(flavor: str, version_id: str, log=print) -> bool:
+    """Newest Paper build / Fabric loader for a downloaded jar."""
+    if flavor == "paper":
+        return update_paper(version_id, log)
+    if flavor == "fabric":
+        return update_fabric(version_id, log)
+    raise ValueError("Only Paper and Fabric servers have updates (Vanilla: choose a newer version)")
+
+
 def _file_hash(path: Path, algo: str) -> str:
     digest = hashlib.new(algo)
     with open(path, "rb") as f:
@@ -250,13 +372,13 @@ def _file_hash(path: Path, algo: str) -> str:
     return digest.hexdigest()
 
 
-def import_paper_cache(log=print) -> list[str]:
-    """Paper downloads the original Mojang jar to `server/cache/mojang_<version>.jar`.
+def import_paper_cache(server_dir: Path, log=print) -> list[str]:
+    """Paper downloads the original Mojang jar to `<server_dir>/cache/mojang_<version>.jar`.
     Register those as downloaded Vanilla servers so they needn't be fetched again.
     Each file is verified against Mojang's SHA1 first. Returns the imported versions."""
     imported = []
     ignored = _ignored()
-    for cached in sorted((config.SERVER_DIR / "cache").glob("mojang_*.jar")):
+    for cached in sorted((server_dir / "cache").glob("mojang_*.jar")):
         version_id = cached.stem.removeprefix("mojang_")
         if version_id in ignored:
             continue
@@ -293,7 +415,15 @@ def download(flavor: str, version_id: str, log=print) -> Path:
     target = jar_path(flavor, version_id)
     if target.exists():
         return target
-    info = _download_vanilla(version_id, log) if flavor == "vanilla" else _download_paper(version_id, log)
+    with _download_lock:
+        if target.exists():  # another server fetched it while we waited
+            return target
+        return _download(flavor, version_id, target, log)
+
+
+def _download(flavor: str, version_id: str, target: Path, log) -> Path:
+    fetch = {"vanilla": _download_vanilla, "paper": _download_paper, "fabric": _download_fabric}[flavor]
+    info = fetch(version_id, log)
     meta_path(flavor, version_id).write_text(json.dumps(info))
     if flavor == "vanilla" and version_id in (ignored := _ignored()):
         _ignored_file().write_text(json.dumps(sorted(ignored - {version_id})))

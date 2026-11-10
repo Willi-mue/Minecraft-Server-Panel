@@ -19,7 +19,8 @@ services:
       TZ: ${TZ:-UTC}
     ports:
       - "${WEB_PORT_HOST:-47318}:47318"   # web panel (admin)
-      - "${MC_PORT_HOST:-25565}:25565"    # Minecraft
+      - "${MC_PORT_HOST:-25565}:25565"    # Minecraft (first server)
+      - "25566-25569:25566-25569"         # Minecraft: additional servers (SERVER_PORTS)
       - "${MAP_PORT_HOST:-47319}:47319"   # live map (share with players)
     volumes:
       - ./data:/data

@@ -2,8 +2,10 @@
 //!
 //! Usage:
 //!   mapgen render --world <world dir> --out <output dir> [--extra <dir>]... [--threads N] [--force]
-//!                 [--client <minecraft client jar>]
+//!                 [--client <minecraft client jar>] [--cave-reach N] [--all-caves]
 //!
+//! 3D: caves are shown up to `--cave-reach` columns (default 32) from where they open to the sky;
+//! `--all-caves` also writes stacks with every cave (`c/`, used by the viewer's height slice).
 //! Incremental: only region files changed since the last run are rendered again.
 //! With `--client` (or tables from an earlier run) the map uses the real block textures/colours.
 //! Prints a one-line JSON summary to stdout.
@@ -34,14 +36,18 @@ struct Args {
     client: Option<PathBuf>,
     threads: usize,
     force: bool,
+    cave_reach: u16,
+    all_caves: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     if it.next().as_deref() != Some("render") {
-        return Err("usage: mapgen render --world <dir> --out <dir> [--extra <dir>]... [--threads N] [--force] [--client <jar>]".into());
+        return Err("usage: mapgen render --world <dir> --out <dir> [--extra <dir>]... [--threads N] [--force] [--client <jar>] [--cave-reach N] [--all-caves]".into());
     }
     let (mut world, mut out, mut extra, mut threads, mut force, mut client) = (None, None, vec![], 2, false, None);
+    let mut cave_reach = 32u16;
+    let mut all_caves = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--world" => world = it.next().map(PathBuf::from),
@@ -50,6 +56,8 @@ fn parse_args() -> Result<Args, String> {
             "--threads" => threads = it.next().and_then(|t| t.parse().ok()).ok_or("--threads needs a number")?,
             "--force" => force = true,
             "--client" => client = it.next().map(PathBuf::from),
+            "--cave-reach" => cave_reach = it.next().and_then(|t| t.parse().ok()).ok_or("--cave-reach needs a number")?,
+            "--all-caves" => all_caves = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -60,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
         client,
         threads: threads.max(1),
         force,
+        cave_reach,
+        all_caves,
     })
 }
 
@@ -113,6 +123,9 @@ struct State {
     /// texture tables the tiles were made with ("" = map-item colours); a change re-renders all
     #[serde(default)]
     assets: String,
+    /// what the 3D stacks show (stack format, cave reach); a change re-renders all
+    #[serde(default)]
+    visibility: String,
 }
 
 fn mtime_ns(path: &Path) -> u128 {
@@ -154,12 +167,13 @@ struct DimSummary {
     bounds: Option<[i32; 4]>,
 }
 
-fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Assets>) -> DimSummary {
+fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Assets>, vis: &render::Visibility) -> DimSummary {
     let dim_dir = out.join(&dim.slug);
     let state_path = dim_dir.join("state.json");
     let old: State = fs::read(&state_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let assets_stamp = assets.map_or(String::new(), |a| a.stamp().to_string());
-    let force = force || old.assets != assets_stamp;
+    let vis_stamp = format!("{}.{}:{}{}", render::VOXEL_FORMAT, render::VOXEL_RULES, vis.reach, if vis.all_caves { ":all" } else { "" });
+    let force = force || old.assets != assets_stamp || (assets.is_some() && old.visibility != vis_stamp);
 
     // Current region files
     let mut current: BTreeMap<(i32, i32), (PathBuf, u128)> = BTreeMap::new();
@@ -193,13 +207,15 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
         .par_iter()
         .map(|&(x, z)| {
             let (path, _) = &current[&(x, z)];
-            let res = render::render_region(path, x, z, dim.ceiling, assets)
+            let res = render::render_region(path, x, z, dim.ceiling, assets, vis)
                 .and_then(|img| {
                     if img.chunks == 0 {
                         let _ = fs::remove_file(tiles::tile_path(&dim_dir, 0, x, z));
                         let _ = fs::remove_file(tiles::height_path(&dim_dir, x, z));
                         let _ = fs::remove_file(tiles::block_path(&dim_dir, x, z));
+                        let _ = fs::remove_file(tiles::plant_path(&dim_dir, x, z));
                         let _ = fs::remove_file(tiles::voxel_path(&dim_dir, x, z));
+                        let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
                         return Ok(0);
                     }
                     tiles::write_rgba(&tiles::tile_path(&dim_dir, 0, x, z), &img.rgba)?;
@@ -210,10 +226,22 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
                             let _ = fs::remove_file(tiles::block_path(&dim_dir, x, z));
                         }
                     }
+                    match &img.plants {
+                        Some(p) => tiles::write_rgba(&tiles::plant_path(&dim_dir, x, z), p)?,
+                        None => {
+                            let _ = fs::remove_file(tiles::plant_path(&dim_dir, x, z));
+                        }
+                    }
                     match &img.voxels {
                         Some(v) => tiles::write_bytes(&tiles::voxel_path(&dim_dir, x, z), v)?,
                         None => {
                             let _ = fs::remove_file(tiles::voxel_path(&dim_dir, x, z));
+                        }
+                    }
+                    match &img.caves {
+                        Some(c) => tiles::write_bytes(&tiles::cave_path(&dim_dir, x, z), c)?,
+                        None => {
+                            let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
                         }
                     }
                     Ok(img.chunks)
@@ -227,7 +255,9 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
         let _ = fs::remove_file(tiles::tile_path(&dim_dir, 0, x, z));
         let _ = fs::remove_file(tiles::height_path(&dim_dir, x, z));
         let _ = fs::remove_file(tiles::block_path(&dim_dir, x, z));
+        let _ = fs::remove_file(tiles::plant_path(&dim_dir, x, z));
         let _ = fs::remove_file(tiles::voxel_path(&dim_dir, x, z));
+        let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
     }
 
     // The top chunk row of the region south of a changed one is shaded against it: patch it
@@ -257,7 +287,7 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
 
     let mut errors = vec![];
     let mut chunks = 0;
-    let mut new_state = State { regions: BTreeMap::new(), levels: 0, assets: assets_stamp };
+    let mut new_state = State { regions: BTreeMap::new(), levels: 0, assets: assets_stamp, visibility: vis_stamp };
     let mut failed = HashSet::new();
     for (x, z, res) in &results {
         match res {
@@ -343,6 +373,9 @@ struct MapsJson<'a> {
     /// texture tables (blocks.json / atlas.png / b/ tiles) exist; the value changes with them
     #[serde(skip_serializing_if = "Option::is_none")]
     blocks: Option<&'a str>,
+    /// stacks with every cave (`c/`) exist next to `v/`
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    caves: bool,
     dimensions: Vec<MapDim<'a>>,
 }
 
@@ -377,13 +410,20 @@ fn main() {
         }
     };
     let dims = discover(&args.world, &args.extra);
-    let summaries: Vec<DimSummary> = dims.iter().map(|d| process(d, &args.out, args.force, assets.as_ref())).collect();
+    let summaries: Vec<DimSummary> = dims
+        .iter()
+        .map(|d| {
+            let vis = render::Visibility { reach: args.cave_reach, all_caves: args.all_caves };
+            process(d, &args.out, args.force, assets.as_ref(), &vis)
+        })
+        .collect();
 
     let maps = MapsJson {
         generated: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
         tile_size: render::SIZE,
         spawn: level::spawn(&args.world),
         blocks: assets.as_ref().map(|a| a.stamp()),
+        caves: args.all_caves && assets.is_some(),
         dimensions: dims
             .iter()
             .zip(&summaries)

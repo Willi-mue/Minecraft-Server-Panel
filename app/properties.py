@@ -32,10 +32,10 @@ def _parse(key: str, raw: str):
         return default
 
 
-def get_all() -> dict:
+def get_all(inst) -> dict:
     result = {}
     for key, (_, default, _) in FIELDS.items():
-        raw = access.get_property(key, None)
+        raw = access.get_property(inst, key, None)
         result[key] = default if raw is None else _parse(key, raw)
     return result
 
@@ -65,18 +65,18 @@ def validate(key: str, value) -> str:
     raise ValueError(key)
 
 
-def apply_presets() -> list[str]:
+def apply_presets(inst) -> list[str]:
     """Write PRESETS for keys not yet in server.properties. Returns the keys written."""
     written = []
     for key, value in PRESETS.items():
-        if access.get_property(key, None) is None:
-            access.set_property(key, value)
+        if access.get_property(inst, key, None) is None:
+            access.set_property(inst, key, value)
             written.append(key)
     return written
 
 
-def update(values: dict) -> dict:
+def update(inst, values: dict) -> dict:
     checked = {key: validate(key, value) for key, value in values.items()}  # all or nothing
     for key, text in checked.items():
-        access.set_property(key, text)
-    return get_all()
+        access.set_property(inst, key, text)
+    return get_all(inst)

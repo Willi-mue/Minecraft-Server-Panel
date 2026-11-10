@@ -8,7 +8,7 @@ import gzip
 import struct
 from pathlib import Path
 
-from . import backup, config
+from . import backup
 
 # NBT tag ids
 _END, _BYTE, _SHORT, _INT, _LONG, _FLOAT, _DOUBLE, _BYTES, _STRING, _LIST, _COMPOUND, _INTS, _LONGS = range(13)
@@ -73,14 +73,14 @@ def parse_nbt(data: bytes) -> dict:
     return r.payload(_COMPOUND)
 
 
-def level_dat() -> Path:
-    return config.SERVER_DIR / backup.level_name() / "level.dat"
+def level_dat(inst) -> Path:
+    return inst.server_dir / backup.level_name(inst) / "level.dat"
 
 
-def saved_version() -> str | None:
+def saved_version(inst) -> str | None:
     """Minecraft version that last saved the world, or None if unknown / no world."""
     try:
-        root = parse_nbt(gzip.decompress(level_dat().read_bytes()))
+        root = parse_nbt(gzip.decompress(level_dat(inst).read_bytes()))
         name = root.get("Data", {}).get("Version", {}).get("Name")
         return name if isinstance(name, str) else None
     except (OSError, ValueError, EOFError, gzip.BadGzipFile, struct.error):

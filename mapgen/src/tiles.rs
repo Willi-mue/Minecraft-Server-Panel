@@ -19,6 +19,11 @@ pub fn voxel_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
     dim_dir.join("v").join(format!("{x}_{z}.bin"))
 }
 
+/// The same stacks with every cave shown (only with `--all-caves`).
+pub fn cave_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
+    dim_dir.join("c").join(format!("{x}_{z}.bin"))
+}
+
 /// Write any file atomically.
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -32,6 +37,11 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Block id + biome per column (only with texture tables), for the textured 2D/3D views.
 pub fn block_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
     dim_dir.join("b").join(format!("{x}_{z}.png"))
+}
+
+/// Plant / flat block per column over the ground (only with texture tables), for the textured 2D view.
+pub fn plant_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
+    dim_dir.join("p").join(format!("{x}_{z}.png"))
 }
 
 /// Write to a temp file and rename, so the web server never serves a half-written tile.
