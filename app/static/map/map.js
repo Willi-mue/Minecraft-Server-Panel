@@ -156,9 +156,11 @@ function showDim(slug, view, refresh = false) {
       const c = map.getCenter();
       state.view3d.show(dim.slug, dim.bounds, c.lng, -c.lat, distanceFor(map.getZoom()), state.maps.blocks || "");
     }
+    loadHeads();
   }
   document.querySelectorAll(".dims button").forEach((b) => b.classList.toggle("active", b.dataset.slug === dim.slug));
   showSpawn();
+  if (typeof drawWaypoints === "function") drawWaypoints(); // waypoints.js
   showBorder(dim, bounds);
   applySettings(); // slice range of this dimension, border on/off
   updatePlayers(state.lastPlayers || []);
@@ -225,6 +227,33 @@ async function loadMaps(first) {
   }
 }
 
+/** Player heads with their own skin (mapgen's heads.json, only with block textures): the 3D view
+ *  puts the skin over the Steve head of the block model. */
+async function loadHeads() {
+  const view = state.view3d, dim = state.dim, v = state.version;
+  if (!view || !state.maps?.blocks) return;
+  let list = [];
+  try {
+    const res = await fetch(`tiles/${dim}/heads.json?v=${v}`);
+    if (res.ok) list = await res.json();
+  } catch { /* none */ }
+  if (state.view3d === view && state.dim === dim && state.mode === "3d") view.setHeads(list);
+  loadDecor();
+}
+
+/** Banner patterns and pot sherds (mapgen's decor.json, only with block textures): the 3D view
+ *  draws them over the block models. */
+async function loadDecor() {
+  const view = state.view3d, dim = state.dim, v = state.version;
+  if (!view || !state.maps?.blocks) return;
+  let list = [];
+  try {
+    const res = await fetch(`tiles/${dim}/decor.json?v=${v}`);
+    if (res.ok) list = await res.json();
+  } catch { /* none */ }
+  if (state.view3d === view && state.dim === dim && state.mode === "3d") view.setDecor(list);
+}
+
 /** Top face y of a block column in the current dimension (2D view: from the height tiles). */
 function heightAt2d(x, z) {
   const id = ++tileId;
@@ -261,16 +290,68 @@ async function loadServers() {
     }
     if (here) document.title = `${here.name} · Live Map`;
     if (!here) servers.push({ id: SERVER, name: SERVER, path: null });
-    select.replaceChildren(...servers.map((s) => new Option(s.name, s.id, false, s.id === SERVER)));
+    setupServerMenu(select, servers);
     select.classList.toggle("hidden", servers.length < 2);
-    select.onchange = () => {
-      const s = servers.find((x) => x.id === select.value);
-      if (s && s.path != null) location.href = new URL(s.path, ROOT).href;
-    };
   } catch {
     select.classList.add("hidden");
   }
   return false;
+}
+
+/** The server switch: a button with the current server's name that opens a list of the others. */
+function setupServerMenu(box, servers) {
+  const btn = box.querySelector(".srv-btn");
+  const menu = box.querySelector(".srv-menu");
+  const current = servers.find((s) => s.id === SERVER);
+  box.querySelector(".srv-name").textContent = current ? current.name : SERVER;
+
+  const items = servers.map((s) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "srv-item" + (s.id === SERVER ? " current" : "");
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(s.id === SERVER));
+    const dot = document.createElement("span");
+    dot.className = "srv-dot";
+    const name = document.createElement("span");
+    name.className = "srv-item-name";
+    name.textContent = s.name;
+    item.append(dot, name);
+    item.onclick = () => {
+      close();
+      if (s.id !== SERVER && s.path != null) location.href = new URL(s.path, ROOT).href;
+    };
+    return item;
+  });
+  menu.replaceChildren(...items);
+
+  const isOpen = () => !menu.classList.contains("hidden");
+  function open() {
+    menu.classList.remove("hidden");
+    btn.setAttribute("aria-expanded", "true");
+    (items.find((i) => i.classList.contains("current")) || items[0])?.focus();
+  }
+  function close() {
+    menu.classList.add("hidden");
+    btn.setAttribute("aria-expanded", "false");
+  }
+  btn.onclick = () => (isOpen() ? close() : open());
+  document.addEventListener("pointerdown", (e) => {
+    if (isOpen() && !box.contains(e.target)) close();
+  });
+  box.addEventListener("keydown", (e) => {
+    if (!isOpen()) return;
+    const i = items.indexOf(document.activeElement);
+    if (e.key === "Escape") {
+      close();
+      btn.focus();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      items[(i + step + items.length) % items.length].focus();
+    } else return;
+    e.preventDefault();
+    e.stopPropagation(); // arrows also fly / pan the map
+  });
 }
 
 // ---------- players ----------
@@ -384,9 +465,14 @@ function skinEl(uuid, cls, body = false) {
   return el;
 }
 
-function markerEl(name, kind = "", skin = null) {
+/** `wp`: the waypoint of a "waypoint" marker (colour, id for clicks; see waypoints.js). */
+function markerEl(name, kind = "", skin = null, wp = null) {
   const el = document.createElement("div");
   el.className = `marker ${kind}`;
+  if (kind === "waypoint" && wp) {
+    el.classList.add(`wp-${wp.color}`);
+    el.dataset.wp = wp.id;
+  }
   const label = document.createElement("div");
   label.className = "name";
   label.textContent = name;
@@ -395,8 +481,8 @@ function markerEl(name, kind = "", skin = null) {
   return el;
 }
 
-function markerIcon(name, kind = "", skin = null) {
-  return L.divIcon({ html: markerEl(name, kind, skin), className: "", iconSize: null, iconAnchor: [0, 0] });
+function markerIcon(name, kind = "", skin = null, wp = null) {
+  return L.divIcon({ html: markerEl(name, kind, skin, wp), className: "", iconSize: null, iconAnchor: [0, 0] });
 }
 
 /** Spawn + players of the current dimension as 3D markers. */
@@ -407,6 +493,9 @@ function update3dMarkers() {
   if (s && s.dimension.split(":").pop() === state.dim) list.push({ name: "Spawn", kind: "spawn", x: s.x + 0.5, z: s.z + 0.5 });
   for (const p of state.lastPlayers || []) {
     if (dimOf(p) === state.dim) list.push({ name: p.name, kind: "player", skin: p.skin, x: p.x, y: p.y, z: p.z });
+  }
+  for (const w of state.waypoints || []) {
+    if (w.dim === state.dim) list.push({ name: w.name, kind: "waypoint", id: w.id, color: w.color, x: w.x + 0.5, y: w.y ?? undefined, z: w.z + 0.5 });
   }
   const pk = state.picked;
   if (pk && pk.dim === state.dim) list.push({ name: "", kind: "picked", x: pk.x + 0.5, y: pk.y ?? undefined, z: pk.z + 0.5 });
@@ -574,7 +663,7 @@ const DIM_Y = { overworld: [-64, 320], the_nether: [0, 128], the_end: [0, 256] }
 const dimY = () => DIM_Y[state.dim] || DIM_Y.overworld;
 const SETTINGS_KEY = "map-settings", VIEW_KEY = SERVER === "main" ? "map-last-view" : `map-last-view:${SERVER}`;
 const settings = {
-  players: true, names: true, spawn: true, border: true,
+  players: true, names: true, spawn: true, waypoints: true, border: true,
   water: true, plants: true, leaves: true, fog: true,
   slice: false, sliceHeight: SLICE_MAX, sliceBottom: 40, flySpeed: 40,
 };
@@ -607,6 +696,7 @@ function applySettings() {
   document.body.classList.toggle("hide-players", !settings.players);
   document.body.classList.toggle("hide-names", !settings.names);
   document.body.classList.toggle("hide-spawn", !settings.spawn);
+  document.body.classList.toggle("hide-waypoints", !settings.waypoints);
   if (state.borderLayer) {
     if (settings.border) state.borderLayer.addTo(map);
     else map.removeLayer(state.borderLayer);
@@ -762,6 +852,7 @@ function drawPicked() {
     }
   }
   update3dMarkers();
+  if (typeof renderWpList === "function") renderWpList(); // "add the picked spot" (waypoints.js)
 }
 
 /** `/execute in <dimension> run tp @s x y z`: works from any dimension. */
@@ -842,6 +933,7 @@ async function setMode(mode) {
     state.view3d.show(dim.slug, dim.bounds, c.lng, -c.lat, distanceFor(map.getZoom()), state.maps.blocks || "");
     update3dMarkers();
     applySettings();
+    loadHeads();
   } else {
     if (state.view3d) {
       const c = state.view3d.center;

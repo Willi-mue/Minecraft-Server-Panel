@@ -144,6 +144,37 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 }
 .server-select:hover, .server-select:focus { border-color: var(--accent); outline: none; }
 
+/* server switch in the top-left panel; that panel stays above the others so the list is not covered */
+.panel.top-left { z-index: 1001; }
+.srv-switch { position: relative; }
+.srv-btn {
+  display: flex; align-items: center; gap: 7px; max-width: 200px; padding: 4px 8px 4px 9px;
+  border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font: inherit; font-weight: 600;
+  color: var(--text); background: rgba(255, 255, 255, .04); transition: border-color .12s, background .12s;
+}
+.srv-btn:hover, .srv-btn[aria-expanded="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.srv-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.srv-icon { flex: none; color: var(--accent); }
+.srv-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv-chevron { flex: none; color: var(--muted); transition: transform .15s; }
+.srv-btn[aria-expanded="true"] .srv-chevron { transform: rotate(180deg); color: var(--accent); }
+.srv-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; min-width: 100%; max-width: 260px; max-height: 50vh; overflow: auto;
+  display: flex; flex-direction: column; gap: 2px; padding: 5px; border-radius: 9px;
+  background: rgb(36, 40, 48); border: 1px solid var(--border); box-shadow: 0 10px 28px rgba(0, 0, 0, .45);
+  animation: srv-in .12s ease-out;
+}
+@keyframes srv-in { from { opacity: 0; transform: translateY(-4px); } }
+.srv-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 10px 6px 8px; border: 0; border-radius: 6px;
+  cursor: pointer; font: inherit; text-align: left; white-space: nowrap; color: var(--text); background: none;
+}
+.srv-item:hover, .srv-item:focus-visible { background: rgba(255, 255, 255, .07); outline: none; }
+.srv-item-name { overflow: hidden; text-overflow: ellipsis; }
+.srv-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--muted); }
+.srv-item.current { color: var(--accent); font-weight: 600; cursor: default; }
+.srv-item.current .srv-dot { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+
 /* Leaflet places the icon's top-left corner on the coordinate (iconAnchor [0, 0]); shift the
    marker so the pin's centre sits there instead (pin is 10 px tall -> half of it below the point),
    otherwise the offset grows to hundreds of blocks when zoomed out. */
@@ -159,6 +190,54 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .marker.spawn .name { color: #e2bd72; }
 .marker.spawn .pin { background: #e2bd72; border-radius: 2px; }
 
+/* ---------- waypoints (waypoints.js) ---------- */
+.wp-green { --wp: #7fc8a4; } .wp-blue { --wp: #6cb8d4; } .wp-red { --wp: #e0605d; } .wp-yellow { --wp: #f1d36b; }
+.wp-purple { --wp: #c58cf0; } .wp-orange { --wp: #f4a259; } .wp-white { --wp: #e8ecf2; }
+.hide-waypoints .marker.waypoint { display: none; }
+.marker.waypoint .name { border-color: var(--wp); }
+.marker.waypoint .pin {
+  width: 11px; height: 11px; border-radius: 2px; background: var(--wp); transform: rotate(45deg); margin-top: 4px;
+}
+.marker.waypoint .name, .marker.waypoint .pin { pointer-events: auto; cursor: pointer; }
+.marker.waypoint { transform: translate(-50%, calc(-100% + 6px)); }
+
+.wp-panel { top: 60px; left: 56px; width: 290px; max-height: calc(100vh - 140px); overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.wp-head { display: flex; align-items: center; justify-content: space-between; }
+.wp-panel .clear { border: 0; background: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 17px; line-height: 1; padding: 0 2px; }
+.wp-panel .clear:hover { color: var(--text); }
+.wp-panel .hint { color: var(--muted); font-size: 11px; }
+.wp-me { display: flex; align-items: center; gap: 8px; }
+.wp-me .server-select { flex: 1; max-width: none; }
+.wp-panel > .mode.small:disabled { opacity: .5; cursor: default; border-color: var(--border); color: var(--muted); }
+.wp-form { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: 8px; background: rgba(0, 0, 0, .18); }
+.wp-form input[type=text] {
+  font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px;
+}
+.wp-form input[type=text]:focus { outline: none; border-color: var(--accent); }
+.wp-colors { display: flex; gap: 5px; }
+.wp-swatch { width: 20px; height: 20px; border-radius: 5px; border: 2px solid transparent; background: var(--wp); cursor: pointer; padding: 0; }
+.wp-swatch.on { border-color: var(--text); box-shadow: 0 0 0 1px rgba(0, 0, 0, .6) inset; }
+.wp-move { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.wp-move input { accent-color: var(--accent); margin: 0; }
+.wp-buttons { display: flex; gap: 6px; }
+.wp-buttons .mode.small { width: auto; }
+.wp-list { display: flex; flex-direction: column; gap: 2px; }
+.wp-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+.wp-row:hover, .wp-row.active { background: rgba(255, 255, 255, .06); }
+.wp-row.active .wp-name { color: var(--accent); }
+.wp-dot { width: 10px; height: 10px; flex: none; border-radius: 2px; background: var(--wp); transform: rotate(45deg); }
+.wp-text { flex: 1; min-width: 0; }
+.wp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wp-where { color: var(--muted); font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wp-tools { display: flex; gap: 2px; flex: none; }
+.wp-tool { border: 1px solid transparent; background: none; color: var(--muted); border-radius: 5px; cursor: pointer; font: inherit; font-size: 11px; padding: 1px 5px; }
+.wp-tool:hover { color: var(--accent); border-color: var(--border); }
+.wp-picked {
+  border: 1px solid var(--border); border-radius: 5px; background: none; color: var(--accent); cursor: pointer;
+  font: inherit; font-family: var(--font); font-size: 11px; font-weight: 700; padding: 0 5px;
+}
+.wp-picked:hover { border-color: var(--accent); }
+
 .empty {
   position: fixed; inset: 0; display: grid; place-items: center; z-index: 999;
   color: var(--muted); font-size: 15px; pointer-events: none;
@@ -167,6 +246,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 @media (max-width: 600px) {
   .top-left { left: 12px; top: auto; bottom: 52px; flex-wrap: wrap; }
   .settings { left: 12px; right: 12px; top: auto; bottom: 110px; width: auto; max-height: 60vh; overflow: auto; }
+  .wp-panel { left: 12px; right: 12px; top: auto; bottom: 110px; width: auto; max-height: 60vh; }
   .top-right { max-width: 45vw; max-height: 35vh; }
   .slicebar { bottom: 110px; height: 40vh; }
 }

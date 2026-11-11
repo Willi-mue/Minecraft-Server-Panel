@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Run, manage and share a Minecraft Java server from your browser. Paper, Fabric or Vanilla, any version.</b><br>
-  One-screen web panel · live 2D/3D map · live backups · Docker or plain Python
+  One-screen web panel · live 2D/3D map · live backups · Docker or a single binary
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 A lightweight web interface for running a Minecraft Java Edition server: **Paper**
 (performance-optimized, plugins, default), **Fabric** (mods) or **Vanilla** (Mojang). Start, stop, restart and back up the server,
 follow the console and chat live, manage players, pick any version and share a live map, all from the
-browser on a single screen. It runs as a Docker container or directly with Python.
+browser on a single screen. It runs as a Docker container or directly as a single program (written in Rust).
 
 ## Live map in 2D and 3D
 
@@ -62,6 +62,8 @@ textures, so you can fly over your world block by block.
   turn the whitelist on/off, one-click add for players the whitelist just turned away
 - 🏆 **Hall of fame** on the live map: tier list by advancements, record podiums (play time, mobs,
   blocks mined, distance …), who has which advancement, a page per player
+- 🚩 **Waypoints** on the live map (2D and 3D): players save named spots, copy a `/tp` for them;
+  each player changes their own, operators all of them
 - 🖼️ **Server list icon**: the panel logo by default, or upload any image (cut and scaled to 64×64)
 - 🙂 **Player profiles** with skin heads (from Mojang only): play time, first/last seen, last position,
   game mode, deaths; actions: game mode, teleport to spawn, heal, clear inventory, kick, ban, OP
@@ -150,11 +152,14 @@ container has a health check on the panel (`GET /api/health`).
 
 ## Running without Docker
 
-Requires Python 3.10+ and Java on your `PATH` (Java 21 for 1.20.5–1.21.x, Java 25 for 26.x).
+Requires [Rust](https://rustup.rs) to build and Java on your `PATH` (Java 21 for 1.20.5–1.21.x,
+Java 25 for 26.x).
 
 ```bash
-pip install -r requirements.txt
-PANEL_PASSWORD=secret python -m app      # PowerShell: $env:PANEL_PASSWORD="secret"; python -m app
+cd panel && cargo build --release && cd ..
+cd mapgen && cargo build --release && cd ..   # live map renderer
+PANEL_PASSWORD=secret panel/target/release/panel
+# PowerShell: $env:PANEL_PASSWORD="secret"; panel\target\release\panel.exe
 ```
 
 The panel runs on <http://localhost:47318>, the live map on <http://localhost:47319>, and data goes to `./data`.
@@ -198,8 +203,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 | You changed | What to do |
 |---|---|
 | HTML / CSS / JS (panel or map viewer) | Save and reload the browser. Minecraft keeps running |
-| Python (`app/*.py`) | `docker compose restart` (restarts Minecraft too) |
-| Rust renderer, Java versions, `requirements.txt` | `docker compose ... up -d --build` |
+| Panel backend (`panel/`), map renderer, Java versions | `docker compose ... up -d --build` |
 
 To make this the default, add `COMPOSE_FILE=docker-compose.yml;docker-compose.dev.yml` to `.env`
 (`:` instead of `;` on Linux/macOS).
@@ -207,12 +211,11 @@ To make this the default, add `COMPOSE_FILE=docker-compose.yml;docker-compose.de
 Tests:
 
 ```bash
-pip install -r requirements-dev.txt
-pytest                                   # panel (Python)
+cd panel && cargo test                   # panel
 cd mapgen && cargo test && cargo build --release   # map renderer (Rust)
 ```
 
-The tests need neither Minecraft, Java nor network access. Without Docker the panel finds the
+The tests need neither Minecraft nor Java. Without Docker the panel finds the
 renderer at `mapgen/target/release/mapgen`, on `PATH`, or via `MAPGEN_BIN`.
 
 ## Security notes

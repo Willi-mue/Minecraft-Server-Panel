@@ -14,6 +14,18 @@ pub fn height_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
     dim_dir.join("h").join(format!("{x}_{z}.png"))
 }
 
+/// Player heads with their own skin in a region (JSON list, see `render::HeadOut`); all of a
+/// dimension are merged into `heads.json`.
+pub fn head_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
+    dim_dir.join("k").join(format!("{x}_{z}.json"))
+}
+
+/// Banner patterns and pot sherds in a region (JSON list, see `render::DecorOut`); all of a
+/// dimension are merged into `decor.json`.
+pub fn decor_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
+    dim_dir.join("d").join(format!("{x}_{z}.json"))
+}
+
 /// 3D block stacks of a region (only with texture tables).
 pub fn voxel_path(dim_dir: &Path, x: i32, z: i32) -> PathBuf {
     dim_dir.join("v").join(format!("{x}_{z}.bin"))

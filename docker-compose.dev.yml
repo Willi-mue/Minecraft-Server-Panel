@@ -5,8 +5,7 @@
 #
 # - HTML/CSS/JS (panel and map viewer): save the file, reload the browser. No rebuild,
 #   no restart, Minecraft keeps running.
-# - Python changes: `docker compose restart` (no rebuild; this restarts Minecraft too).
-# - Rust map renderer, Java versions, requirements: still need `--build`.
+# - Backend (panel/, Rust), map renderer, Java versions: need `--build`.
 #
 # Tip: put COMPOSE_FILE=docker-compose.yml;docker-compose.dev.yml into .env to make this the
 # default (on Linux/macOS use ":" instead of ";").

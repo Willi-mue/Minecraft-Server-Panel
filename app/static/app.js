@@ -95,10 +95,12 @@ function icon(name, cls = "i") {
   return svg;
 }
 
-/** Panel-styled replacement for confirm(): resolves true when the action button is used
- *  (Escape, Cancel or a click on the backdrop = false). */
+/** Panel-styled replacement for confirm() / prompt(): resolves true when the action button is used
+ *  (Escape, Cancel or a click on the backdrop = false). With `input` ({label, placeholder, value,
+ *  maxLength, match}) it shows a text field and resolves to its text, or null when cancelled;
+ *  `match` keeps the action button disabled until the field equals it (typed confirmation). */
 let askDialog = null;
-function ask({ title, text = "", ok = "OK", danger = false, iconName = null }) {
+function ask({ title, text = "", ok = "OK", danger = false, iconName = null, input = null }) {
   if (!askDialog) {
     askDialog = el("dialog", { className: "dialog ask-dialog" });
     askDialog.addEventListener("click", (e) => { if (e.target === askDialog) askDialog.close(""); });
@@ -107,16 +109,36 @@ function ask({ title, text = "", ok = "OK", danger = false, iconName = null }) {
   const cancel = el("button", { type: "button", className: "btn ghost", textContent: "Cancel" });
   const go = el("button", { type: "button", className: `btn ${danger ? "danger" : "primary"}` },
     iconName ? icon(iconName) : null, ok);
+  let field = null;
+  if (input) {
+    field = el("input", { type: "text", autocomplete: "off", value: input.value || "",
+      placeholder: input.placeholder || "", maxLength: input.maxLength || 200 });
+    if (input.match != null) {
+      const check = () => { go.disabled = field.value.trim() !== input.match; };
+      field.addEventListener("input", check);
+      check();
+    }
+  }
   cancel.addEventListener("click", () => askDialog.close(""));
-  go.addEventListener("click", () => askDialog.close("ok"));
-  askDialog.replaceChildren(el("form", { method: "dialog" },
+  const form = el("form", { method: "dialog" },
     el("div", { className: "card-head" }, el("h2", { textContent: title })),
     ...text.split("\n").filter(Boolean).map((line, i) => el("p", { className: i ? "muted" : "", textContent: line })),
-    el("div", { className: "dialog-actions" }, el("span"), cancel, go)));
+    field ? el("label", { className: "field" }, input.label ? el("span", { className: "label", textContent: input.label }) : null, field) : null,
+    el("div", { className: "dialog-actions" }, el("span"), cancel, go));
+  // Enter in the field and the action button both submit
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!go.disabled) askDialog.close("ok");
+  });
+  go.type = "submit";
+  askDialog.replaceChildren(form);
   askDialog.returnValue = "";
   askDialog.showModal();
-  go.focus();
-  return new Promise((resolve) => askDialog.addEventListener("close", () => resolve(askDialog.returnValue === "ok"), { once: true }));
+  (field || go).focus();
+  return new Promise((resolve) => askDialog.addEventListener("close", () => {
+    const yes = askDialog.returnValue === "ok";
+    resolve(field ? (yes ? field.value.trim() : null) : yes);
+  }, { once: true }));
 }
 
 function tag(text, cls = "", iconName = null) {
@@ -253,7 +275,10 @@ function showPage() {
   document.title = `${ui.server?.name || "Server"} · ${PAGES[ui.page]} · Server Panel`;
   if (ui.page === "players") loadAccess();
   if (ui.page === "server") showServerIcon();
-  if (ui.page === "world") loadCaveReach();
+  if (ui.page === "world") {
+    loadCaveReach();
+    loadWaypoints();
+  }
   if (ui.page === "addons") showAddonTab(ui.atab);
 }
 
@@ -376,12 +401,32 @@ $("#rename-form").addEventListener("submit", async (e) => {
   }
 });
 
+$("#port-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const port = Number($("#server-port").value);
+  if (!ui.server || port === ui.server.port) return;
+  if (!(await ask({ title: `Change the game port to ${port}?`,
+                    text: `Players then connect with <address>:${port}.\nOpen the port in your router (and in Docker) for friends outside your network.`,
+                    ok: "Change port", iconName: "floppy-disk" }))) {
+    $("#server-port").value = ui.server.port;
+    return;
+  }
+  try {
+    const s = await api(S("/port"), { method: "PUT", body: { port } });
+    ui.server.port = s.port;
+    await loadServers();
+    renderServerInfo();
+    toast(`Game port set to ${s.port}`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
 $("#delete-server-btn").addEventListener("click", async () => {
   const name = ui.server?.name;
-  const typed = prompt(`Delete the server "${name}"?\n\nIts world and settings are deleted. Its backups are kept.\n` +
-                       "Type the server name to confirm:");
+  const typed = await ask({ title: `Delete the server "${name}"?`, text: "Its world and settings are deleted. Its backups are kept.",
+    ok: "Delete server", danger: true, iconName: "trash", input: { label: "Type the server name to confirm", match: name } });
   if (typed === null) return;
-  if (typed.trim() !== name) return toast("The name did not match, nothing was deleted", true);
   try {
     await api(S(), { method: "DELETE" });
     await loadServers();
@@ -398,7 +443,7 @@ function renderServerInfo() {
   $("#server-name").textContent = s.name;
   $("#server-rename").value = s.name;
   $("#port-label").textContent = `port ${s.port}`;
-  $("#fact-port").textContent = s.port;
+  if (document.activeElement !== $("#server-port")) $("#server-port").value = s.port;
   $("#fact-id").textContent = s.id === "main" ? "data/server" : `data/servers/${s.id}`;
   $("#delete-server-btn").classList.toggle("hidden", s.id === "main");
   // every server has its own live map (has_map stays as a flag for the API)
@@ -520,6 +565,7 @@ function renderStatus(s) {
 
   // The public map runs on its own port (plain HTTP), same host as the panel
   const mapUrl = s.map_port ? `http://${location.hostname}:${s.map_port}${s.map_path || "/"}` : null;
+  ui.mapUrl = mapUrl;
   for (const a of [$("#map-link"), $("#map-open")]) {
     a.classList.toggle("hidden", !mapUrl);
     if (mapUrl) a.href = mapUrl;
@@ -709,17 +755,22 @@ const isOnline = (n) => !!ui.status?.players.some((p) => lower(p) === lower(n));
 function accessQuestion(kind, action, name) {
   const add = action === "add";
   switch (kind) {
-    case "whitelist": return add ? `Add ${name} to the whitelist?` : `Remove ${name} from the whitelist?`;
-    case "ops": return add ? `Make ${name} an operator?\n\nOperators can use every command, including /stop and /op.`
-                           : `Remove the operator rights of ${name}?`;
-    default: return add ? `Ban ${name}?${isOnline(name) ? "\nThey are kicked right away." : ""}` : `Unban ${name}?`;
+    case "whitelist": return add
+      ? { title: `Allow ${name} to join?`, text: `${name} is added to the whitelist.`, ok: "Allow", iconName: "user-plus" }
+      : { title: `Remove ${name} from the whitelist?`, text: "They cannot join any more while the whitelist is on.", ok: "Remove", danger: true, iconName: "x" };
+    case "ops": return add
+      ? { title: `Make ${name} an operator?`, text: "Operators can use every command, including /stop and /op.", ok: "Make operator", danger: true, iconName: "crown-simple" }
+      : { title: `Remove the operator rights of ${name}?`, ok: "Remove rights", iconName: "crown-simple" };
+    default: return add
+      ? { title: `Ban ${name}?`, text: isOnline(name) ? "They are kicked right away." : "", ok: "Ban", danger: true, iconName: "prohibit" }
+      : { title: `Unban ${name}?`, text: "They can join again.", ok: "Unban", iconName: "check" };
   }
 }
 
 /** Change whitelist / operators / bans after asking (`asked`: the caller already asked, e.g. the
  *  ban reason prompt). */
 async function changeAccess(kind, action, name, reason = "", asked = false) {
-  if (!asked && !confirm(accessQuestion(kind, action, name))) return false;
+  if (!asked && !(await ask(accessQuestion(kind, action, name)))) return false;
   try {
     const res = await api(S(`/access/${kind}`), { method: "POST", body: { action, name, reason } });
     ui.access = res;
@@ -748,8 +799,8 @@ $$(".add-form").forEach((form) => form.addEventListener("submit", async (e) => {
 
 $("#wl-enabled").addEventListener("change", async (e) => {
   const on = e.target.checked;
-  if (!confirm(on ? "Turn the whitelist on?\nOnly players on the list can join then."
-                  : "Turn the whitelist off?\nEverybody can join then.")) {
+  if (!(await ask(on ? { title: "Turn the whitelist on?", text: "Only players on the list can join then.", ok: "Turn on", iconName: "shield-check" }
+                     : { title: "Turn the whitelist off?", text: "Everybody can join then.", ok: "Turn off", danger: true }))) {
     e.target.checked = !on;
     return;
   }
@@ -794,7 +845,7 @@ async function iconPng(file) {
 $("#server-icon-file").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   e.target.value = "";
-  if (!file || !confirm(`Use ${file.name} as the icon in the server list?\nIt replaces the current icon.`)) return;
+  if (!file || !(await ask({ title: "Change the server icon?", text: `Use ${file.name} as the icon in the server list?\nIt replaces the current icon.`, ok: "Use image", iconName: "upload-simple" }))) return;
   try {
     const res = await fetch(S("/icon"), { method: "PUT", body: await iconPng(file), credentials: "same-origin" });
     const data = await res.json().catch(() => ({}));
@@ -807,7 +858,7 @@ $("#server-icon-file").addEventListener("change", async (e) => {
 });
 
 $("#server-icon-reset").addEventListener("click", async () => {
-  if (!confirm("Use the panel logo as the icon in the server list again?")) return;
+  if (!(await ask({ title: "Reset the server icon?", text: "Use the panel logo as the icon in the server list again.", ok: "Reset" }))) return;
   try {
     await api(S("/icon"), { method: "DELETE" });
     toast("Server icon reset to the panel logo");
@@ -947,7 +998,8 @@ profilePanel.querySelectorAll("[data-pf]").forEach((b) => b.addEventListener("cl
     case "heal": return playerAction("heal");
     case "clear": return playerAction("clear");
     case "kick": {
-      const reason = prompt(`Kick ${name}? Optional reason:`, "");
+      const reason = await ask({ title: `Kick ${name}?`, text: "They can join again right away.", ok: "Kick", danger: true,
+        iconName: "sign-out", input: { label: "Reason (optional)", placeholder: "Shown to the player" } });
       if (reason !== null) playerAction("kick", reason, true);
       return;
     }
@@ -957,7 +1009,7 @@ profilePanel.querySelectorAll("[data-pf]").forEach((b) => b.addEventListener("cl
       if (banOf(name) || ui.profile.ban) {
         await changeAccess("bans", "remove", name);
       } else {
-        const reason = prompt(`Ban ${name}?${isOnline(name) ? " They are kicked right away." : ""} Optional reason:`, "");
+        const reason = await ask({ ...accessQuestion("bans", "add", name), input: { label: "Reason (optional)", placeholder: "Shown to the player" } });
         if (reason === null) return;
         await changeAccess("bans", "add", name, reason, true);
       }
@@ -1059,12 +1111,14 @@ async function toggleDatapack(p, input) {
 
 function removeDatapack(p) {
   const note = p.in_library ? "It stays in the library." : "It is NOT in the library, so it will be gone (copy it to the library first to keep it).";
-  if (confirm(`Remove ${p.name} from this world?\n${note}`)) packAction(p, "world", "DELETE", "removed from the world");
+  ask({ title: `Remove ${p.name} from this world?`, text: note, ok: "Remove", danger: true, iconName: "x" })
+    .then((yes) => yes && packAction(p, "world", "DELETE", "removed from the world"));
 }
 
 function deleteDatapack(p) {
   const note = p.installed ? "The copy in the current world stays." : "";
-  if (confirm(`Delete ${p.name} from the library (all servers)?\n${note}`)) packAction(p, "library", "DELETE", "deleted from the library");
+  ask({ title: `Delete ${p.name} from the library?`, text: `It is removed for all servers.\n${note}`, ok: "Delete", danger: true, iconName: "trash" })
+    .then((yes) => yes && packAction(p, "library", "DELETE", "deleted from the library"));
 }
 
 async function uploadDatapack(file) {
@@ -1205,7 +1259,8 @@ const toggleAddon = (a, input) => {
 };
 
 function deleteAddon(a) {
-  if (confirm(`Delete ${a.name} (${a.file}) from this server?`)) addonAction(`/addons/${encodeURIComponent(a.file)}`, "DELETE", `${a.name} deleted`);
+  ask({ title: `Delete ${a.name}?`, text: `${a.file} is removed from this server.`, ok: "Delete", danger: true, iconName: "trash" })
+    .then((yes) => yes && addonAction(`/addons/${encodeURIComponent(a.file)}`, "DELETE", `${a.name} deleted`));
 }
 
 async function updateAddon(a) {
@@ -1462,8 +1517,9 @@ function renderBackups(list, keep, interval) {
 
 async function restoreBackup(b) {
   if (ui.status?.state !== "stopped") return toast("Stop the server before restoring a backup", true);
-  if (!confirm(`Restore the backup from ${b.created.replace("T", " ")}?\n\n` +
-               "The current world is replaced. It is saved as a new backup first, so you can go back.")) return;
+  if (!(await ask({ title: "Restore this backup?", text: `Backup from ${b.created.replace("T", " ")}.\n` +
+                    "The current world is replaced. It is saved as a new backup first, so you can go back.",
+                    ok: "Restore", danger: true, iconName: "clock-counter-clockwise" }))) return;
   try {
     await api(S(`/backups/${encodeURIComponent(b.name)}/restore`), { method: "POST" });
     toast("Restoring…");
@@ -1508,8 +1564,8 @@ $("#cave-form").addEventListener("submit", (e) => {
   e.preventDefault();
   saveVisibility({ cave_reach: Number($("#cave-reach").value) });
 });
-$("#all-caves").addEventListener("change", (e) => {
-  if (e.target.checked && !confirm("Show all caves with the height cut?\n\nEverybody who opens the map can then see hidden caves (and bases in them).")) {
+$("#all-caves").addEventListener("change", async (e) => {
+  if (e.target.checked && !(await ask({ title: "Show all caves with the height cut?", text: "Everybody who opens the map can then see hidden caves (and bases in them).", ok: "Show caves", danger: true }))) {
     e.target.checked = false;
     return;
   }
@@ -1524,6 +1580,118 @@ $("#map-enabled").addEventListener("change", async (e) => {
     toast(`Live map ${e.target.checked ? "on" : "off"}`);
   } catch (err) {
     e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
+
+// ---------- waypoints of the live map (waypoints.py) ----------
+
+const WP_COLOR = { green: "#7fc8a4", blue: "#6cb8d4", red: "#e0605d", yellow: "#f1d36b", purple: "#c58cf0", orange: "#f4a259", white: "#e8ecf2" };
+const WP_DIMS = { overworld: "Overworld", the_nether: "Nether", the_end: "End" };
+let wpData = null, wpEditing = null, wpColor = "green";
+
+async function loadWaypoints() {
+  const card = $("#wp-card");
+  card.classList.toggle("hidden", !ui.server?.has_map);
+  if (!ui.server?.has_map) return;
+  const sid = ui.sid;
+  try {
+    const d = await api(S("/waypoints"));
+    if (sid !== ui.sid) return;
+    wpData = d;
+    renderWaypoints();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function renderWaypoints() {
+  const list = [...wpData.waypoints].sort((a, b) => a.dim.localeCompare(b.dim) || a.name.localeCompare(b.name));
+  $("#wp-count").textContent = list.length ? `· ${list.length}` : "";
+  const ul = $("#wp-list");
+  ul.replaceChildren();
+  if (!list.length) ul.append(el("li", { className: "empty", textContent: "No waypoints yet" }));
+  for (const w of list) {
+    const where = `${w.x} ${w.y ?? "~"} ${w.z} · ${WP_DIMS[w.dim] || w.dim}`;
+    const show = el("a", {
+      className: "icon-btn small", target: "_blank", rel: "noopener", title: "Show on the live map",
+      ariaLabel: `Show ${w.name} on the live map`,
+    }, icon("map-trifold"));
+    if (ui.mapUrl) show.href = `${ui.mapUrl}#${w.dim}/${w.x}/${w.z}/2`;
+    else show.classList.add("hidden");
+    const editBtn = el("button", { type: "button", className: "icon-btn small", title: "Edit", ariaLabel: `Edit ${w.name}` }, icon("pencil"));
+    editBtn.addEventListener("click", () => openWaypointDialog(w));
+    const del = el("button", { type: "button", className: "icon-btn small", title: "Delete", ariaLabel: `Delete ${w.name}` }, icon("trash"));
+    del.addEventListener("click", () => deleteWaypoint(w));
+    const dot = el("span", { className: "wp-dot" });
+    dot.style.background = WP_COLOR[w.color] || WP_COLOR.green;
+    ul.append(el("li", {},
+      dot,
+      el("div", { className: "grow" },
+        el("div", { className: "title", textContent: w.name }),
+        el("div", { className: "meta", textContent: w.owner ? `${where} · ${w.owner}` : where })),
+      el("div", { className: "row-actions" }, show, editBtn, del)));
+  }
+}
+
+async function deleteWaypoint(w) {
+  if (!await ask({ title: "Delete waypoint?", text: `"${w.name}" disappears from the live map for everybody.`, ok: "Delete", danger: true, iconName: "trash" })) return;
+  try {
+    await api(S(`/waypoints/${encodeURIComponent(w.id)}`), { method: "DELETE" });
+    toast(`Deleted "${w.name}"`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+  loadWaypoints();
+}
+
+const wpDialog = $("#wp-dialog");
+
+function openWaypointDialog(w = null) {
+  wpEditing = w;
+  $("#wp-title").textContent = w ? "Edit waypoint" : "New waypoint";
+  $("#wp-name").value = w ? w.name : "";
+  const colors = wpData?.colors || Object.keys(WP_COLOR);
+  wpColor = w ? w.color : colors[0];
+  $("#wp-colors").replaceChildren(...colors.map((c) => {
+    const b = el("button", { type: "button", className: `wp-swatch${c === wpColor ? " on" : ""}`, title: c, ariaLabel: c });
+    b.style.background = WP_COLOR[c] || "#888";
+    b.addEventListener("click", () => {
+      wpColor = c;
+      for (const s of $("#wp-colors").children) s.classList.toggle("on", s === b);
+    });
+    return b;
+  }));
+  const dims = { ...WP_DIMS };
+  if (w && !dims[w.dim]) dims[w.dim] = w.dim;
+  $("#wp-dim").replaceChildren(...Object.entries(dims).map(([v, label]) => new Option(label, v, false, v === (w?.dim || "overworld"))));
+  $("#wp-x").value = w ? w.x : 0;
+  $("#wp-y").value = w?.y ?? "";
+  $("#wp-z").value = w ? w.z : 0;
+  // the owner is chosen when adding; a waypoint keeps it
+  $("#wp-owner-wrap").classList.toggle("hidden", !!w);
+  $("#wp-owner").replaceChildren(new Option("Nobody (set in the panel)", ""), ...(wpData?.players || []).map((n) => new Option(n, n)));
+  wpDialog.showModal();
+  $("#wp-name").focus();
+}
+
+$("#wp-new").addEventListener("click", () => openWaypointDialog());
+wpDialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => wpDialog.close()));
+
+$("#wp-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const y = $("#wp-y").value.trim();
+  const body = {
+    name: $("#wp-name").value, color: wpColor, dim: $("#wp-dim").value,
+    x: Number($("#wp-x").value), y: y === "" ? null : Number(y), z: Number($("#wp-z").value),
+  };
+  try {
+    if (wpEditing) await api(S(`/waypoints/${encodeURIComponent(wpEditing.id)}`), { method: "PUT", body });
+    else await api(S("/waypoints"), { method: "POST", body: { ...body, owner: $("#wp-owner").value || null } });
+    wpDialog.close();
+    toast(`Saved "${body.name.trim()}"`);
+    loadWaypoints();
+  } catch (err) {
     toast(err.message, true);
   }
 });
@@ -1577,7 +1745,7 @@ async function updateInstalled(v) {
 }
 
 async function deleteInstalled(v) {
-  if (!confirm(`Delete the downloaded server ${flavorLabel(v.flavor, v.version)}?\nWorlds and backups are not affected.`)) return;
+  if (!(await ask({ title: `Delete ${flavorLabel(v.flavor, v.version)}?`, text: "The downloaded server jar is deleted. Worlds and backups are not affected.", ok: "Delete", danger: true, iconName: "trash" }))) return;
   try {
     await api(`/api/versions/${v.flavor}/${encodeURIComponent(v.version)}`, { method: "DELETE" });
     toast(`${flavorLabel(v.flavor, v.version)} deleted`);
@@ -1834,8 +2002,9 @@ function settingsDirty() {
 async function saveSettings() {
   const { flavor, version } = ui.sel;
   if (version && version !== ui.settings?.version && directionVsWorld(version) < 0 &&
-      !confirm(`Downgrade warning\n\nYour world was last played on ${ui.world.version}. ` +
-               `Running it on the older ${version} can corrupt or reset parts of it.\n\nMake a backup first. Continue anyway?`)) {
+      !(await ask({ title: "Downgrade warning", text: `Your world was last played on ${ui.world.version}.\n` +
+               `Running it on the older ${version} can corrupt or reset parts of it. Make a backup first.`,
+               ok: "Continue anyway", danger: true, iconName: "warning" }))) {
     return false;
   }
   try {
@@ -1967,15 +2136,15 @@ $("#world-form").addEventListener("submit", async (e) => {
 // ---------- actions ----------
 
 const CONFIRM = {
-  stop: "Stop the server?",
-  restart: "Restart the server?",
-  kill: "Force kill the server process? Unsaved world data may be lost.",
+  stop: { title: "Stop the server?", ok: "Stop", iconName: "stop" },
+  restart: { title: "Restart the server?", ok: "Restart", iconName: "arrow-clockwise" },
+  kill: { title: "Force kill the server process?", text: "Unsaved world data may be lost.", ok: "Kill", danger: true, iconName: "lightning" },
 };
 
 $$("[data-action]").forEach((btn) => {
   btn.addEventListener("click", async () => {
     const action = btn.dataset.action;
-    if (CONFIRM[action] && !confirm(`${ui.server?.name || "Server"}: ${CONFIRM[action]}`)) return;
+    if (CONFIRM[action] && !(await ask({ ...CONFIRM[action], text: `${ui.server?.name || "Server"}\n${CONFIRM[action].text || ""}` }))) return;
     // Start what is selected on the Server page, even if "Save" wasn't pressed
     if (action === "start" && settingsDirty() && !(await saveSettings())) return;
     const countdown = Number($("#countdown").value);

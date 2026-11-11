@@ -404,6 +404,14 @@
             <p id="map-note" class="muted small-text"></p>
           </section>
         </div>
+        <section class="card hidden" id="wp-card">
+          <div class="card-head">
+            <h2>Waypoints <span id="wp-count" class="muted small-text"></span></h2>
+            <button type="button" id="wp-new" class="btn small"><svg class="i"><use href="/static/icons.svg#ph-plus"/></svg> Add</button>
+          </div>
+          <p class="muted small-text">Players set these on the live map: each changes their own, operators all of them. Here you can change every one.</p>
+          <ul id="wp-list" class="list"></ul>
+        </section>
       </section>
 
       <!-- ============ Server ============ -->
@@ -495,8 +503,14 @@
               <input id="server-rename" maxlength="40" autocomplete="off">
               <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-pencil"/></svg> Rename</button>
             </form>
+            <form id="port-form" class="inline-form">
+              <label for="server-port" class="sr-only">Game port</label>
+              <input id="server-port" type="number" min="1024" max="65535" step="1" autocomplete="off" title="Game port">
+              <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-floppy-disk"/></svg> Set port</button>
+            </form>
+            <p class="muted small-text">The game port players connect to (change it while the server is stopped). Open it in
+              your router; with Docker it must also be published in <code>docker-compose.yml</code> (25565–25569 by default).</p>
             <dl class="facts">
-              <div><dt>Game port</dt><dd id="fact-port">–</dd></div>
               <div><dt>Folder</dt><dd id="fact-id">–</dd></div>
             </dl>
             <div class="icon-row">
@@ -616,6 +630,36 @@
     </form>
   </dialog>
 
+
+  <!-- Waypoint (live map) -->
+  <dialog id="wp-dialog" class="dialog">
+    <form id="wp-form" method="dialog">
+      <div class="card-head">
+        <h2 id="wp-title">Waypoint</h2>
+        <button type="button" class="icon-btn small" data-close aria-label="Close"><svg class="i"><use href="/static/icons.svg#ph-x"/></svg></button>
+      </div>
+      <label for="wp-name">Name</label>
+      <input id="wp-name" maxlength="32" required autocomplete="off">
+      <div class="label">Colour</div>
+      <div id="wp-colors" class="wp-colors"></div>
+      <label for="wp-dim">Dimension</label>
+      <select id="wp-dim" class="select"></select>
+      <div class="wp-xyz">
+        <label>X <input id="wp-x" type="number" step="1" required></label>
+        <label>Y <input id="wp-y" type="number" step="1" placeholder="ground"></label>
+        <label>Z <input id="wp-z" type="number" step="1" required></label>
+      </div>
+      <div id="wp-owner-wrap">
+        <label for="wp-owner">Belongs to</label>
+        <select id="wp-owner" class="select"></select>
+      </div>
+      <div class="dialog-actions">
+        <span></span>
+        <button type="button" class="btn ghost" data-close>Cancel</button>
+        <button type="submit" class="btn primary"><svg class="i"><use href="/static/icons.svg#ph-floppy-disk"/></svg> Save</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Game rules -->
   <dialog id="rules-dialog" class="dialog wide">

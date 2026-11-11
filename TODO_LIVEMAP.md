@@ -3,15 +3,16 @@
 Code-Aufgaben für die Live-Map. Entscheidungen/Infos vom Entwickler: [DEV_TODO_LIVEMAP.md](DEV_TODO_LIVEMAP.md).
 Das Panel (Dashboard) hat eigene Listen: [TODO_DASHBOARD.md](TODO_DASHBOARD.md), [DEV_TODO_DASHBOARD.md](DEV_TODO_DASHBOARD.md).
 
-**Zuständigkeit** (damit zwei Claudes parallel arbeiten können): `mapgen/`, `app/livemap.py`,
-`app/mapserver.py`, `app/static/map/` und die Tests dieser Module.
-Gemeinsam genutzte Dateien (`app/main.py`, `app/server.py`, `app/config.py`, `Dockerfile`,
-`docker-compose*.yml`, `README.md`, `CLAUDE.md`) nur gezielt und klein ändern und direkt vorher neu
-lesen – dort arbeitet evtl. gleichzeitig die Dashboard-Seite.
+**Zuständigkeit** (damit zwei Claudes parallel arbeiten können): `mapgen/`, `panel/src/livemap.rs`,
+`mapserver.rs`, `leaderboard.rs`, `waypoints.rs`, `app/static/map/` und die Tests dieser Module.
+Gemeinsam genutzte Dateien (`panel/src/main.rs`, `api.rs`, `server.rs`, `config.rs`, `tasks.rs`,
+`skins.rs`, `Dockerfile`, `docker-compose*.yml`, `README.md`, `CLAUDE.md`) nur gezielt und klein ändern
+und direkt vorher neu lesen – dort arbeitet evtl. gleichzeitig die Dashboard-Seite.
+Seit 2026-11-11 ist das Backend Rust (`panel/`), das Python-Backend (`app/*.py`) ist gelöscht.
 
 ## Offen
 
-- [ ] Offen in 3D: Drachenkopf, Banner, Glocken, Shulkerkisten u. a. Block-Entities ohne Modell werden weiterhin nicht gezeichnet; Spielerköpfe zeigen immer Steve (Skin aus dem Block-Entity wird nicht gelesen).
+Zurzeit nichts.
 
 ## Später (Optimierungen)
 

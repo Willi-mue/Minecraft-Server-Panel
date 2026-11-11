@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::assets::Assets;
-use crate::chunk::{Chunk, Column, EMPTY};
+use crate::chunk::{Chunk, Column, Decor, EMPTY};
 use crate::colors::{self, HIGH, LOW, NORMAL};
 use crate::region::Region;
 
@@ -19,6 +19,10 @@ pub struct RegionImage {
     /// With texture tables: RGBA per column = id (u16, big endian) of the plant / flat block over
     /// the coloured block, 0, 255 (0 = none)
     pub plants: Option<Vec<u8>>,
+    /// player heads with a skin of their own that the 3D stacks show (`heads.json`)
+    pub heads: Vec<HeadOut>,
+    /// banner patterns and pot sherds that the 3D stacks show (`decor.json`)
+    pub decor: Vec<DecorOut>,
     /// With texture tables: the 3D block stacks (zlib, see `voxels`)
     pub voxels: Option<Vec<u8>>,
     /// With texture tables and `Visibility::all_caves`: the same stacks with every cave shown
@@ -95,6 +99,130 @@ pub fn brightness(col: &Column, north_y: i32, checker: bool) -> u8 {
     if d > 0.6 { HIGH } else if d < -0.6 { LOW } else { NORMAL }
 }
 
+/// A player head for `heads.json`: position, skin texture hash, y rotation of the model (degrees,
+/// the face looks north at 0) and whether it hangs on a wall.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadOut {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub skin: String,
+    pub rot: u16,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall: bool,
+}
+
+/// What the 3D viewer draws over a block model (`decor.json`): banner pattern layers or pot
+/// sherds. `rot` turns the model (front on the north side) clockwise seen from above, like the
+/// blockstate `y` rotation of its block model.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecorOut {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub rot: u16,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall: bool,
+    /// banner layers, bottom first: atlas index of the flag front, of its back, dye colour "rrggbb"
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub banner: Vec<(u32, u32, String)>,
+    /// pot sides: atlas index of back, left, right, front (0 = plain); left/right as seen from the front
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pot: Option<[u32; 4]>,
+}
+
+/// Rotation and wall flag of a banner block state, the same quarter turns as its block model
+/// (`assets::entity_models`). None: not a banner.
+pub fn banner_pose(state: &str) -> Option<(u16, bool)> {
+    let (name, props) = state.split_once('[').unwrap_or((state, ""));
+    let prop = |k: &str| props.trim_end_matches(']').split(',').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
+    if name.ends_with("_wall_banner") {
+        Some((facing_rot(prop("facing").unwrap_or("north")), true))
+    } else if name.ends_with("_banner") {
+        let r: usize = prop("rotation").and_then(|v| v.parse().ok()).unwrap_or(8); // the default state
+        Some(([180, 270, 0, 90][((r + 2) / 4) % 4], false))
+    } else {
+        None
+    }
+}
+
+/// Model rotation of a decorated pot: `facing` is where the placing player looked, the front
+/// sherd faces that player.
+pub fn pot_rot(state: &str) -> Option<u16> {
+    let (name, props) = state.split_once('[').unwrap_or((state, ""));
+    if name != "minecraft:decorated_pot" {
+        return None;
+    }
+    let facing = props.trim_end_matches(']').split(',').find_map(|kv| kv.strip_prefix("facing=")).unwrap_or("north");
+    Some((facing_rot(facing) + 180) % 360)
+}
+
+fn facing_rot(facing: &str) -> u16 {
+    match facing {
+        "east" => 90,
+        "south" => 180,
+        "west" => 270,
+        _ => 0,
+    }
+}
+
+/// Dye colour of a banner layer as "rrggbb".
+fn dye_hex(name: &str) -> Option<&'static str> {
+    crate::assets::DYES.iter().find(|(n, _)| *n == name.trim_start_matches("minecraft:")).map(|(_, rgb)| *rgb)
+}
+
+/// Is the conduit at (x, y, z) active? The game's rule: the 26 blocks around it are water and at
+/// least 16 of the 42 frame positions (the three 5×5 rings through it) are prismarine, prismarine
+/// bricks, dark prismarine or sea lanterns. `id_at` = block id (None outside the loaded chunks);
+/// waterlogged blocks count as not water.
+pub fn conduit_active(x: i32, y: i32, z: i32, id_at: impl Fn(i32, i32, i32) -> Option<u16>, water: u16, frame: &[u16]) -> bool {
+    for i in -1..=1 {
+        for j in -1..=1 {
+            for k in -1..=1 {
+                if (i, j, k) != (0, 0, 0) && id_at(x + i, y + j, z + k) != Some(water) {
+                    return false;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for i in -2i32..=2 {
+        for j in -2i32..=2 {
+            for k in -2i32..=2 {
+                let (a, b, c) = (i.abs(), j.abs(), k.abs());
+                let ring = (i == 0 && (b == 2 || c == 2)) || (j == 0 && (a == 2 || c == 2)) || (k == 0 && (a == 2 || b == 2));
+                if (a > 1 || b > 1 || c > 1) && ring && id_at(x + i, y + j, z + k).is_some_and(|id| frame.contains(&id)) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n >= 16
+}
+
+/// Rotation and wall flag of a player head block state ("minecraft:player_head[rotation=8]"), the
+/// same quarter turns its block model uses (see `assets::entity_models`). None: not a player head.
+pub fn head_pose(state: &str) -> Option<(u16, bool)> {
+    let (name, props) = state.split_once('[').unwrap_or((state, ""));
+    let prop = |k: &str| props.trim_end_matches(']').split(',').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
+    match name {
+        "minecraft:player_head" => {
+            let r: usize = prop("rotation").and_then(|v| v.parse().ok()).unwrap_or(0);
+            Some(([180, 270, 0, 90][((r + 2) / 4) % 4], false))
+        }
+        "minecraft:player_wall_head" => {
+            let rot = match prop("facing").unwrap_or("north") {
+                "east" => 90,
+                "south" => 180,
+                "west" => 270,
+                _ => 0,
+            };
+            Some((rot, true))
+        }
+        _ => None,
+    }
+}
+
 pub fn render_region(path: &Path, rx: i32, rz: i32, ceiling: Option<i32>, assets: Option<&Assets>, vis: &Visibility) -> std::io::Result<RegionImage> {
     let region = Region::open(path)?;
     let parsed = parse_chunks(&region, rx, rz, assets);
@@ -123,14 +251,14 @@ pub fn render_region(path: &Path, rx: i32, rz: i32, ceiling: Option<i32>, assets
         }
         p
     });
-    let (voxels, caves) = match assets {
+    let (voxels, caves, heads, decor) = match assets {
         Some(_) => {
-            let (v, c) = voxels(&parsed, path.parent().unwrap_or(Path::new(".")), rx, rz, ceiling, &cols, assets, vis)?;
-            (Some(v), c)
+            let (v, c, h, d) = voxels(&parsed, path.parent().unwrap_or(Path::new(".")), rx, rz, ceiling, &cols, assets, vis)?;
+            (Some(v), c, h, d)
         }
-        None => (None, None),
+        None => (None, None, vec![], vec![]),
     };
-    Ok(RegionImage { rgba, heights, blocks, plants, voxels, caves, chunks })
+    Ok(RegionImage { rgba, heights, blocks, plants, voxels, caves, chunks, heads, decor })
 }
 
 /// Version of the `v/` stack files (part of the state, so a new format re-renders everything).
@@ -163,7 +291,8 @@ pub const AIR_MARK: u16 = 0xFFFE;
 /// below a water entry water down to the next entry, below the last entry solid, except when the
 /// last entry is AIR_MARK: then air down to the world bottom (the End's void under an island).
 /// Returns these stacks and, with `vis.all_caves`, the same format with every cave shown.
-fn voxels(own_chunks: &[Option<Chunk>], dir: &Path, rx: i32, rz: i32, ceiling: Option<i32>, cols: &[Column], assets: Option<&Assets>, vis: &Visibility) -> std::io::Result<(Vec<u8>, Option<Vec<u8>>)> {
+#[allow(clippy::type_complexity)]
+fn voxels(own_chunks: &[Option<Chunk>], dir: &Path, rx: i32, rz: i32, ceiling: Option<i32>, cols: &[Column], assets: Option<&Assets>, vis: &Visibility) -> std::io::Result<(Vec<u8>, Option<Vec<u8>>, Vec<HeadOut>, Vec<DecorOut>)> {
     // Everything is computed on a grid padded by two chunks on every side with the adjacent chunks
     // of the 4 neighbour regions, so caves crossing a region border look the same from both sides.
     const PAD: usize = 32;
@@ -286,6 +415,100 @@ fn voxels(own_chunks: &[Option<Chunk>], dir: &Path, rx: i32, rz: i32, ceiling: O
             }
         }
     }
+    // block entities of the region's own chunks with their local column
+    let entities = || {
+        own_chunks.iter().enumerate().filter_map(|(ci, c)| c.as_ref().map(|c| (ci, c))).flat_map(move |(ci, chunk)| {
+            chunk.decor.iter().filter_map(move |e| {
+                let (lx, lz) = (e.x - rx * SIZE as i32, e.z - rz * SIZE as i32);
+                let inside = (0..SIZE as i32).contains(&lx) && (0..SIZE as i32).contains(&lz) && (lz as usize / 16) * 32 + lx as usize / 16 == ci;
+                inside.then_some((chunk, lx as usize, lz as usize, e))
+            })
+        })
+    };
+    // where in a stack set a block is listed (only what the stacks show gets decorated)
+    let listed = |pools: &[Vec<(i16, u16)>], k: usize, col: usize, y: i32, id: u16| -> Option<usize> {
+        let start = spans[k][col] as usize;
+        (start..start + counts[k][col] as usize).find(|&p| pools[k][p] == (y as i16, id))
+    };
+    // active conduits (frame complete) get the `active=true` state: cage and eye
+    if let Some(a) = assets {
+        let (off, on) = (a.block_id("minecraft:conduit[active=false]"), a.block_id("minecraft:conduit[active=true]"));
+        let water = a.block_id("minecraft:water");
+        let frame: Vec<u16> = ["prismarine", "prismarine_bricks", "dark_prismarine", "sea_lantern"]
+            .iter()
+            .map(|n| a.block_id(&format!("minecraft:{n}")))
+            .filter(|&i| i != 0)
+            .collect();
+        // the frame may reach into the neighbour regions: their chunks next to a conduit, loaded
+        // once (none for the diagonal corners)
+        let mut outside: std::collections::HashMap<(i32, i32), Option<Chunk>> = std::collections::HashMap::new();
+        for (_, _, _, e) in entities().filter(|(_, _, _, e)| e.decor == Decor::Conduit) {
+            for (dx, dz) in [(-2, -2), (-2, 2), (2, -2), (2, 2)] {
+                let (cx, cz) = ((e.x + dx - rx * SIZE as i32).div_euclid(16), (e.z + dz - rz * SIZE as i32).div_euclid(16));
+                if !(0..32).contains(&cx) || !(0..32).contains(&cz) {
+                    outside.entry((cx, cz)).or_insert_with(|| load((cx + PAD_CHUNKS as i32) as usize, (cz + PAD_CHUNKS as i32) as usize));
+                }
+            }
+        }
+        let id_at = |x: i32, y: i32, z: i32| -> Option<u16> {
+            let (lx, lz) = (x - rx * SIZE as i32, z - rz * SIZE as i32);
+            let (cx, cz) = (lx.div_euclid(16), lz.div_euclid(16));
+            let c = if (0..32).contains(&cx) && (0..32).contains(&cz) {
+                own_chunks[(cz * 32 + cx) as usize].as_ref()?
+            } else {
+                outside.get(&(cx, cz))?.as_ref()?
+            };
+            Some(c.block_id(lx.rem_euclid(16) as usize, y, lz.rem_euclid(16) as usize))
+        };
+        if off != 0 && on != 0 && water != 0 {
+            let active: Vec<(usize, i32)> = entities()
+                .filter(|(_, _, _, e)| e.decor == Decor::Conduit && conduit_active(e.x, e.y, e.z, id_at, water, &frame))
+                .map(|(_, lx, lz, e)| (lz * SIZE + lx, e.y))
+                .collect();
+            for (col, y) in active {
+                for k in 0..sets.len() {
+                    if let Some(p) = listed(&pools, k, col, y, off) {
+                        pools[k][p].1 = on;
+                    }
+                }
+            }
+        }
+    }
+    // banner patterns and pot sherds over the block models
+    let mut decor = vec![];
+    if let Some(a) = assets {
+        for (chunk, lx, lz, e) in entities() {
+            let id = chunk.block_id(lx % 16, e.y, lz % 16);
+            if listed(&pools, 0, lz * SIZE + lx, e.y, id).is_none() {
+                continue;
+            }
+            let state = &a.block(id).name;
+            let (x, y, z) = (e.x, e.y, e.z);
+            match &e.decor {
+                Decor::Banner(layers) => {
+                    let Some((rot, wall)) = banner_pose(state) else { continue };
+                    let banner: Vec<(u32, u32, String)> = layers
+                        .iter()
+                        .filter_map(|(p, c)| {
+                            let [front, back] = a.pattern(p)?;
+                            Some((front, back, dye_hex(c)?.to_string()))
+                        })
+                        .collect();
+                    if !banner.is_empty() {
+                        decor.push(DecorOut { x, y, z, rot, wall, banner, pot: None });
+                    }
+                }
+                Decor::Pot(sides) => {
+                    let Some(rot) = pot_rot(state) else { continue };
+                    let pot = [0, 1, 2, 3].map(|i| a.sherd(&sides[i]).unwrap_or(0));
+                    if pot != [0; 4] {
+                        decor.push(DecorOut { x, y, z, rot, wall: false, banner: vec![], pot: Some(pot) });
+                    }
+                }
+                Decor::Conduit => {}
+            }
+        }
+    }
     let encode = |k: usize| -> std::io::Result<Vec<u8>> {
         let (counts, spans, pool) = (&counts[k], &spans[k], &pools[k]);
         let mut raw = Vec::with_capacity(4 + SIZE * SIZE + pool.len() * 4);
@@ -302,8 +525,27 @@ fn voxels(own_chunks: &[Option<Chunk>], dir: &Path, rx: i32, rz: i32, ceiling: O
         std::io::Write::write_all(&mut enc, &raw)?;
         enc.finish()
     };
+    // player heads with their own skin, only where the normal stacks show them (a head in a hidden
+    // cave stays hidden)
+    let mut heads = vec![];
+    for (ci, chunk) in own_chunks.iter().enumerate() {
+        let Some(chunk) = chunk else { continue };
+        for h in &chunk.heads {
+            let (lx, lz) = (h.x - rx * SIZE as i32, h.z - rz * SIZE as i32);
+            if !(0..SIZE as i32).contains(&lx) || !(0..SIZE as i32).contains(&lz) || (lz as usize / 16) * 32 + lx as usize / 16 != ci {
+                continue;
+            }
+            let id = chunk.block_id(lx as usize % 16, h.y, lz as usize % 16);
+            let Some((rot, wall)) = assets.and_then(|a| head_pose(&a.block(id).name)) else { continue };
+            let col = lz as usize * SIZE + lx as usize;
+            let start = spans[0][col] as usize;
+            if pools[0][start..start + counts[0][col] as usize].iter().any(|&(y, i)| y as i32 == h.y && i == id) {
+                heads.push(HeadOut { x: h.x, y: h.y, z: h.z, skin: h.skin.clone(), rot, wall });
+            }
+        }
+    }
     let caves = if sets.len() > 1 { Some(encode(1)?) } else { None };
-    Ok((encode(0)?, caves))
+    Ok((encode(0)?, caves, heads, decor))
 }
 
 /// How many columns each run of non-solid blocks is away from the sky (u16::MAX = further than
@@ -399,6 +641,55 @@ mod tests {
 
     fn land(y: i32) -> Column {
         Column { color: colors::GRASS, y, depth: 0, ..EMPTY }
+    }
+
+    #[test]
+    fn head_poses() {
+        assert_eq!(head_pose("minecraft:player_head[rotation=8]"), Some((0, false)));
+        assert_eq!(head_pose("minecraft:player_head"), Some((180, false)));
+        assert_eq!(head_pose("minecraft:player_wall_head[facing=east]"), Some((90, true)));
+        assert_eq!(head_pose("minecraft:zombie_head[rotation=8]"), None);
+    }
+
+    #[test]
+    fn banner_and_pot_poses() {
+        assert_eq!(banner_pose("minecraft:red_banner[rotation=8]"), Some((0, false)));
+        assert_eq!(banner_pose("minecraft:red_wall_banner[facing=west]"), Some((270, true)));
+        assert_eq!(banner_pose("minecraft:stone"), None);
+        // a pot placed looking north shows its front to the south
+        assert_eq!(pot_rot("minecraft:decorated_pot[facing=north,waterlogged=false]"), Some(180));
+        assert_eq!(pot_rot("minecraft:decorated_pot[facing=east]"), Some(270));
+        assert_eq!(pot_rot("minecraft:flower_pot"), None);
+        assert_eq!(dye_hex("lime"), Some("80c71f"));
+    }
+
+    #[test]
+    fn conduit_frame() {
+        const WATER: u16 = 1;
+        const PRISMARINE: u16 = 2;
+        // a conduit at 0,0,0 in water with `frame` prismarine blocks on the frame positions
+        let world = |frame: usize| {
+            let mut spots = vec![];
+            for i in -2i32..=2 {
+                for j in -2i32..=2 {
+                    for k in -2i32..=2 {
+                        let (a, b, c) = (i.abs(), j.abs(), k.abs());
+                        let ring = (i == 0 && (b == 2 || c == 2)) || (j == 0 && (a == 2 || c == 2)) || (k == 0 && (a == 2 || b == 2));
+                        if (a > 1 || b > 1 || c > 1) && ring {
+                            spots.push((i, j, k));
+                        }
+                    }
+                }
+            }
+            assert_eq!(spots.len(), 42);
+            spots.truncate(frame);
+            move |x, y, z| Some(if spots.contains(&(x, y, z)) { PRISMARINE } else { WATER })
+        };
+        assert!(conduit_active(0, 0, 0, world(16), WATER, &[PRISMARINE]));
+        assert!(!conduit_active(0, 0, 0, world(15), WATER, &[PRISMARINE]));
+        // not in water: inactive
+        let dry = |x: i32, y: i32, z: i32| if (x, y, z) == (1, 0, 0) { Some(0) } else { world(42)(x, y, z) };
+        assert!(!conduit_active(0, 0, 0, dry, WATER, &[PRISMARINE]));
     }
 
     #[test]

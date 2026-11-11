@@ -17,7 +17,7 @@ use serde_json::Value;
 pub const TEX: usize = 16;
 const ATLAS_COLS: usize = 32;
 /// Bump when the tables change shape: forces a rebuild (and a re-render of all tiles).
-const FORMAT: &str = "v8";
+const FORMAT: &str = "v11";
 
 /// How the viewer draws a block.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -148,11 +148,21 @@ struct Registry {
     /// (0 = the block's top, 1 = side, 2 = bottom, 3… = `extra`); a face that is not there is all `NO_FACE`.
     /// Entry 0 is empty.
     #[serde(default)]
-    shapes: Vec<Vec<Vec<u8>>>,
+    shapes: Vec<Vec<Vec<i16>>>,
+    /// banner patterns (pattern id and asset id, "minecraft:creeper") -> atlas indices of the
+    /// flag's front and back as a white mask (the viewer multiplies it with the dye colour)
+    #[serde(default)]
+    patterns: BTreeMap<String, [u32; 2]>,
+    /// pottery sherd item ids ("minecraft:angler_pottery_sherd") -> atlas index of the pot side
+    #[serde(default)]
+    sherds: BTreeMap<String, u32>,
 }
 
 pub const PART_LEN: usize = 6 + 6 * 5;
-const NO_FACE: u8 = 255;
+const NO_FACE: i16 = 255;
+/// how far entity model boxes may reach out of their block (1/16 block)
+const FREE_MIN: f64 = -32.0;
+const FREE_MAX: f64 = 48.0;
 
 pub struct Assets {
     reg: Registry,
@@ -216,7 +226,10 @@ impl Assets {
         }
         let state_props = seen
             .into_iter()
-            .map(|(base, props)| (base, props.into_iter().map(|(k, vals)| { let d = default_value(&k, &vals); (k, d) }).collect()))
+            .map(|(base, props)| {
+                let props = props.into_iter().map(|(k, vals)| (default_value(&base, &k, &vals), k)).map(|(d, k)| (k, d)).collect();
+                (base, props)
+            })
             .collect();
         Ok(Some(Assets { reg, version, block_ids, biome_ids, state_props }))
     }
@@ -251,6 +264,16 @@ impl Assets {
             }
         }
         self.block_id(name)
+    }
+
+    /// Atlas indices (front, back) of a banner pattern by pattern or asset id.
+    pub fn pattern(&self, id: &str) -> Option<[u32; 2]> {
+        self.reg.patterns.get(id).copied()
+    }
+
+    /// Atlas index of the pot side showing a sherd (by item id); None for bricks / unknown.
+    pub fn sherd(&self, item: &str) -> Option<u32> {
+        self.reg.sherds.get(item).copied()
     }
 
     pub fn block(&self, id: u16) -> &Block {
@@ -339,6 +362,7 @@ fn resource(name: &str) -> Option<&str> {
 }
 
 /// Model as needed for a map: merged texture variables and the elements.
+#[derive(Clone)]
 struct Model {
     textures: HashMap<String, String>,
     elements: Vec<Value>,
@@ -429,14 +453,19 @@ fn slope(model: &Model) -> i8 {
         .map_or(0, |a| if a > 0.0 { 1 } else if a < 0.0 { -1 } else { 0 })
 }
 
-/// The value a block state property most likely has when a palette entry leaves it out
-/// (its default state).
-fn default_value(prop: &str, values: &[String]) -> String {
-    const PREFERRED: [&str; 10] = ["north", "bottom", "lower", "straight", "north_south", "false", "left", "none", "floor", "y"];
-    // walls stand with a post, rods and chains upright
+/// The value a block state property has when a palette entry leaves it out (the block's default
+/// state; checked against the server's `--reports` blocks.json for the blocks registered per state).
+fn default_value(block: &str, prop: &str, values: &[String]) -> String {
+    const PREFERRED: [&str; 12] = ["north", "bottom", "lower", "straight", "north_south", "false", "single", "left", "none", "floor", "y", "foot"];
+    let block = block.trim_start_matches("minecraft:");
+    // walls stand with a post, rods and chains upright; standing banners and signs face south
+    // (rotation 8), heads north; redstone torches burn
     let pref: &[&str] = match prop {
         "up" => &["true"],
+        "lit" => &["true"],
         "facing" if values.iter().any(|v| v == "up") => &["up"],
+        "rotation" if block.ends_with("_head") || block.ends_with("_skull") => &["0"],
+        "rotation" => &["8"],
         _ => &PREFERRED,
     };
     pref.iter()
@@ -461,6 +490,9 @@ struct Applied {
     x: i64,
     y: i64,
     uvlock: bool,
+    /// boxes may reach out of the block (entity models: banners, dragon heads); jar models are
+    /// cut to it
+    free: bool,
 }
 
 fn applied(x: &Value) -> Option<Applied> {
@@ -470,6 +502,7 @@ fn applied(x: &Value) -> Option<Applied> {
         x: x.get("x").and_then(Value::as_i64).unwrap_or(0),
         y: x.get("y").and_then(Value::as_i64).unwrap_or(0),
         uvlock: x.get("uvlock").and_then(Value::as_bool).unwrap_or(false),
+        free: false,
     })
 }
 
@@ -606,7 +639,7 @@ fn rotate(mut p: [f64; 3], mut dir: usize, a: &Applied) -> ([f64; 3], usize) {
 /// chains) are kept as boxes of zero thickness; tilted boxes are moved, not tilted, except tall
 /// ones leaning sideways (wall torches): those are cut into short pieces moved one by one, a
 /// staircase that leans like the model.
-fn model_parts(model: &Model, a: &Applied, mut slot: impl FnMut(&str) -> u8) -> Vec<Vec<u8>> {
+fn model_parts(model: &Model, a: &Applied, mut slot: impl FnMut(&str) -> u8) -> Vec<Vec<i16>> {
     let mut out = vec![];
     for e in &model.elements {
         let (Some(from), Some(to)) = (e.get("from"), e.get("to")) else { continue };
@@ -647,13 +680,14 @@ fn model_parts(model: &Model, a: &Applied, mut slot: impl FnMut(&str) -> u8) -> 
             }
             let (p0, _) = rotate(lo, UP, a);
             let (p1, _) = rotate(hi, UP, a);
-            let b = [0, 1, 2].map(|i| p0[i].min(p1[i]).clamp(0.0, 16.0).round());
-            let t = [0, 1, 2].map(|i| p0[i].max(p1[i]).clamp(0.0, 16.0).round());
+            let (min, max) = if a.free { (FREE_MIN, FREE_MAX) } else { (0.0, 16.0) };
+            let b = [0, 1, 2].map(|i| p0[i].min(p1[i]).clamp(min, max).round());
+            let t = [0, 1, 2].map(|i| p0[i].max(p1[i]).clamp(min, max).round());
             if (0..3).any(|i| t[i] < b[i]) || (0..3).filter(|&i| t[i] == b[i]).count() > 1 {
                 continue;
             }
             let bx = [b[0], b[1], b[2], t[0], t[1], t[2]];
-            let mut part = bx.map(|v| v as u8).to_vec();
+            let mut part = bx.map(|v| v as i16).to_vec();
             part.resize(PART_LEN, NO_FACE);
             for (d, name) in DIR_NAMES.iter().enumerate() {
                 // of a cut box only the lowest piece has the bottom, the highest the top
@@ -677,9 +711,9 @@ fn model_parts(model: &Model, a: &Applied, mut slot: impl FnMut(&str) -> u8) -> 
                 }
                 let o = 6 + to_dir * 5;
                 for (k, v) in uv.iter().enumerate() {
-                    part[o + k] = v.clamp(0.0, 16.0).round() as u8;
+                    part[o + k] = v.clamp(0.0, 16.0).round() as i16;
                 }
-                part[o + 4] = slot(&tex);
+                part[o + 4] = slot(&tex) as i16;
             }
             if part[6..].iter().any(|&v| v != NO_FACE) {
                 out.push(part);
@@ -859,13 +893,15 @@ fn crop_rects(rects: &str) -> Vec<Rect> {
         .collect()
 }
 
-/// First animation frame of a texture as 16×16 RGBA. `crop|<texture>|<base width>|x,y,w,h[,v];…`
-/// (entity textures: chests, heads) cuts rectangles out of a texture (coordinates for the texture
-/// at `base width`), stacks them top to bottom (`v`: upside down) and scales that to 16×16.
+/// First animation frame of a texture as 16×16 RGBA. `crop|<texture>|<base width>|x,y,w,h[,v];…[|*rrggbb]`
+/// (entity textures: chests, heads, banners …) cuts rectangles out of a texture (coordinates for
+/// the texture at `base width`), stacks them top to bottom (`v`: upside down), scales that to 16×16
+/// and multiplies it with the colour (banner dyes).
 fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
     if let Some(spec) = tex.strip_prefix("crop|") {
         let mut it = spec.split('|');
         let (name, base, rects) = (it.next()?, it.next()?.parse::<usize>().ok()?, crop_rects(it.next()?));
+        let tint = it.next().and_then(|t| hex(t.strip_prefix('*')));
         let (px, w, h) = decode_png(jar, name)?;
         let k = w as f64 / base as f64;
         let width = rects.iter().map(|r| r.0[2]).max()?;
@@ -887,7 +923,13 @@ fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
                 let rx = (x * width / TEX).min(r[2].max(1) - 1);
                 let (sx, sy) = (((r[0] + rx) as f64 * k) as usize, ((r[1] + ry) as f64 * k) as usize);
                 if sx < w && sy < h {
-                    out[(y * TEX + x) * 4..(y * TEX + x) * 4 + 4].copy_from_slice(&px[sy * w + sx]);
+                    let mut p = px[sy * w + sx];
+                    if let Some(c) = tint {
+                        for k in 0..3 {
+                            p[k] = (p[k] as u16 * c[k] as u16 / 255) as u8;
+                        }
+                    }
+                    out[(y * TEX + x) * 4..(y * TEX + x) * 4 + 4].copy_from_slice(&p);
                 }
             }
         }
@@ -907,23 +949,51 @@ fn texture_rgba(jar: &mut Jar, tex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Blocks the game draws as entities (no model in the jar): chests and mob heads, as boxes with
-/// textures cut out of the entity textures. Per state: (state key, models as applied).
+/// One box of an entity model: `faces` = (direction, texture variable), each face showing the
+/// whole texture (the textures are cut to fit, see `texture_rgba`).
+fn element(from: [i32; 3], to: [i32; 3], faces: &[(&str, &str)]) -> Value {
+    let faces: serde_json::Map<String, Value> =
+        faces.iter().map(|(d, t)| (d.to_string(), serde_json::json!({"uv": [0, 0, 16, 16], "texture": format!("#{t}")}))).collect();
+    serde_json::json!({"from": from, "to": to, "faces": faces})
+}
+
+/// Every face of a box: top, bottom, front (north before the state turns it), back, sides.
+const BOX: [(&str, &str); 6] = [("up", "top"), ("down", "bottom"), ("north", "front"), ("south", "back"), ("west", "side"), ("east", "side")];
+
+fn entity_model(elements: Vec<Value>, textures: &[(&str, String)]) -> Model {
+    Model { textures: textures.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(), elements }
+}
+
+fn turned(x: i64, y: i64) -> Applied {
+    Applied { model: String::new(), x, y, uvlock: false, free: true }
+}
+
+/// Facing of wall blocks -> y rotation of a model whose front is on the north side.
+const QUARTERS: [(&str, i64); 4] = [("north", 0), ("east", 90), ("south", 180), ("west", 270)];
+
+/// `rotation=0..15` of standing heads and banners: 0 looks south, 4 west, 8 north, 12 east (to the
+/// nearest quarter).
+fn sixteenths(model: &Model) -> Vec<(String, Vec<(Model, Applied)>)> {
+    (0..16).map(|r| (format!("rotation={r}"), vec![(model.clone(), turned(0, [180, 270, 0, 90][((r + 2) / 4) % 4]))])).collect()
+}
+
+fn walls(model: &Model) -> Vec<(String, Vec<(Model, Applied)>)> {
+    QUARTERS.iter().map(|(facing, y)| (format!("facing={facing}"), vec![(model.clone(), turned(0, *y))])).collect()
+}
+
+/// Dye colours (the colour the game multiplies banner patterns with).
+pub const DYES: [(&str, &str); 16] = [
+    ("white", "f9fffe"), ("orange", "f9801d"), ("magenta", "c74ebd"), ("light_blue", "3ab3da"),
+    ("yellow", "fed83d"), ("lime", "80c71f"), ("pink", "f38baa"), ("gray", "474f52"),
+    ("light_gray", "9d9d97"), ("cyan", "169c9c"), ("purple", "8932b8"), ("blue", "3c44aa"),
+    ("brown", "835432"), ("green", "5e7c16"), ("red", "b02e26"), ("black", "1d1d21"),
+];
+
+/// Blocks the game draws as entities (no model in the jar): chests, mob heads, shulker boxes,
+/// banners, conduits and decorated pots, as boxes with textures cut out of the entity textures.
+/// Per state: (state key, models as applied). Approximations: banners show their base colour (no
+/// patterns), pots their plain sides, player heads Steve (the 3D viewer puts the real skin over it).
 fn entity_models(short: &str) -> Option<Vec<(String, Vec<(Model, Applied)>)>> {
-    const QUARTERS: [(&str, i64); 4] = [("north", 0), ("east", 90), ("south", 180), ("west", 270)];
-    let model = |elements: Value, textures: &[(&str, String)]| Model {
-        textures: textures.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-        elements: elements.as_array().cloned().unwrap_or_default(),
-    };
-    let applied = |y: i64| Applied { model: String::new(), x: 0, y, uvlock: false };
-    // one box, the front on the north side (turned by the state)
-    let cuboid = |from: [u8; 3], to: [u8; 3]| {
-        let face = |t: &str| serde_json::json!({"uv": [0, 0, 16, 16], "texture": t});
-        serde_json::json!([{ "from": from, "to": to, "faces": {
-            "up": face("#top"), "down": face("#bottom"), "north": face("#front"),
-            "south": face("#back"), "west": face("#side"), "east": face("#side")
-        }}])
-    };
     // chests: lid (14×5×14) over body (14×10×14) of the 64×64 chest texture, the lock on the front
     let chest = match short.trim_start_matches("waxed_") {
         "chest" => Some("normal"),
@@ -949,16 +1019,140 @@ fn entity_models(short: &str) -> Option<Vec<(String, Vec<(Model, Applied)>)>> {
             // the halves of a double chest reach the block edge where they meet (a left half of a
             // chest facing north: east)
             for (kind, x0, x1) in [("single", 1, 15), ("left", 1, 16), ("right", 0, 15)] {
-                out.push((format!("facing={facing},type={kind}"), vec![(model(cuboid([x0, 0, 1], [x1, 14, 15]), &tex), applied(y))]));
+                out.push((format!("facing={facing},type={kind}"), vec![(entity_model(vec![element([x0, 0, 1], [x1, 14, 15], &BOX)], &tex), turned(0, y))]));
             }
         }
         return Some(out);
     }
-    // heads: the 8×8×8 head of the mob texture (piglin: 10 wide)
+
+    // shulker boxes: the lid side band over the base band; facing = where the lid opens
+    if let Some(color) = short.strip_suffix("shulker_box") {
+        let texture = match color.strip_suffix('_') {
+            Some(c) => format!("entity/shulker/shulker_{c}"),
+            None if color.is_empty() => "entity/shulker/shulker".to_string(),
+            None => return None,
+        };
+        let crop = |rects: &str| format!("crop|{texture}|64|{rects}");
+        // (the toothed rows where lid and base overlap are left out: only together are they solid)
+        let side = crop("0,16,16,8;0,48,16,4");
+        let tex = [("top", crop("16,0,16,16")), ("bottom", crop("32,28,16,16")), ("front", side.clone()), ("back", side.clone()), ("side", side)];
+        let m = entity_model(vec![element([0, 0, 0], [16, 16, 16], &BOX)], &tex);
+        let facings = [("up", 0, 0), ("down", 180, 0), ("south", 90, 0), ("west", 90, 90), ("north", 90, 180), ("east", 90, 270)];
+        return Some(facings.iter().map(|(f, x, y)| (format!("facing={f}"), vec![(m.clone(), turned(*x, *y))])).collect());
+    }
+
+    // banners: flag in the dye colour, pole and cross bar (the game draws them 2/3 of the model
+    // size); standing ones reach 1.8 blocks up, wall ones hang into the block below
+    let (color, wall) = match short.strip_suffix("_wall_banner") {
+        Some(c) => (Some(c), true),
+        None => (short.strip_suffix("_banner"), false),
+    };
+    if let Some(dye) = color.and_then(|c| DYES.iter().find(|(n, _)| *n == c)).map(|(_, rgb)| rgb) {
+        let crop = |rects: &str| format!("crop|entity/banner/banner_base|64|{rects}");
+        let tex = [
+            ("top", crop("1,0,20,1")),
+            ("flag", format!("{}|*{dye}", crop("1,1,20,40"))),
+            ("flag_back", format!("{}|*{dye}", crop("22,1,20,40"))),
+            ("side", crop("0,1,1,40")),
+            ("pole", crop("46,2,2,42")),
+            ("bar", crop("2,44,20,2")),
+        ];
+        let flag = [("north", "flag"), ("south", "flag_back"), ("up", "top"), ("down", "top"), ("west", "side"), ("east", "side")];
+        let bar = [("up", "bar"), ("down", "bar"), ("north", "bar"), ("south", "bar"), ("west", "pole"), ("east", "pole")];
+        let pole = [("up", "pole"), ("down", "pole"), ("north", "pole"), ("south", "pole"), ("west", "pole"), ("east", "pole")];
+        return Some(if wall {
+            // against the wall behind (south before turning)
+            walls(&entity_model(vec![element([1, -13, 13], [15, 12, 14], &flag), element([1, 12, 14], [15, 14, 16], &bar)], &tex))
+        } else {
+            sixteenths(&entity_model(
+                vec![element([7, 0, 7], [9, 28, 9], &pole), element([1, 28, 7], [15, 30, 9], &bar), element([1, 2, 6], [15, 28, 7], &flag)],
+                &tex,
+            ))
+        });
+    }
+
+    // conduits: the shell; `active=true` (not a real property: mapgen sets it when the frame is
+    // complete, see render.rs) = the cage with the open eye inside
+    if short == "conduit" {
+        let crop = |rects: &str| format!("crop|entity/conduit/base|32|{rects}");
+        let tex = [("top", crop("6,0,6,6")), ("bottom", crop("12,0,6,6")), ("front", crop("0,6,6,6")), ("back", crop("0,6,6,6")), ("side", crop("0,6,6,6"))];
+        let shell = entity_model(vec![element([5, 5, 5], [11, 11, 11], &BOX)], &tex);
+        let cage = |rects: &str| format!("crop|entity/conduit/cage|32|{rects}");
+        let tex = [
+            ("top", cage("8,0,8,8")),
+            ("bottom", cage("16,0,8,8")),
+            ("front", cage("8,8,8,8")),
+            ("back", cage("24,8,8,8")),
+            ("side", cage("0,8,8,8")),
+            ("eye", "crop|entity/conduit/open_eye|16|0,0,8,8".to_string()),
+        ];
+        let eye = [("up", "eye"), ("down", "eye"), ("north", "eye"), ("south", "eye"), ("west", "eye"), ("east", "eye")];
+        let active = entity_model(vec![element([4, 4, 4], [12, 12, 12], &BOX), element([6, 6, 6], [10, 10, 10], &eye)], &tex);
+        return Some(vec![("active=false".to_string(), vec![(shell, turned(0, 0))]), ("active=true".to_string(), vec![(active, turned(0, 0))])]);
+    }
+
+    if short == "decorated_pot" {
+        let crop = |rects: &str| format!("crop|entity/decorated_pot/decorated_pot_base|32|{rects}");
+        let body = "entity/decorated_pot/decorated_pot_side".to_string();
+        let tex = [
+            ("top", crop("0,13,14,14")),
+            ("bottom", crop("14,13,14,14")),
+            ("front", body.clone()),
+            ("back", body.clone()),
+            ("side", body),
+            ("neck_top", crop("8,0,8,8")),
+            ("neck", crop("0,8,8,4")),
+        ];
+        let neck = [("up", "neck_top"), ("north", "neck"), ("south", "neck"), ("west", "neck"), ("east", "neck")];
+        let m = entity_model(vec![element([1, 0, 1], [15, 16, 15], &BOX), element([4, 16, 4], [12, 20, 12], &neck)], &tex);
+        // per facing (the same model), so decor.json can turn the sherds (`render::pot_rot`)
+        return Some(walls(&m));
+    }
+
+    if let Some(rest) = short.trim_start_matches("waxed_").strip_suffix("copper_golem_statue") {
+        let texture = match rest {
+            "" => "copper_golem".to_string(),
+            "exposed_" | "weathered_" | "oxidized_" => format!("copper_golem_{}", rest.trim_end_matches('_')),
+            _ => return None,
+        };
+        return Some(copper_golem_statue(&texture));
+    }
+
+    // heads
     let (base, wall) = match short.strip_suffix("_wall_skull").or_else(|| short.strip_suffix("_wall_head")) {
         Some(b) => (b, true),
         None => (short.strip_suffix("_skull").or_else(|| short.strip_suffix("_head"))?, false),
     };
+    if base == "dragon" {
+        // head (12 px: the game shows it at 3/4 size) with upper jaw and lower jaw sticking out in front
+        let crop = |rects: &str| format!("crop|entity/enderdragon/dragon|256|{rects}");
+        let tex = [
+            ("top", crop("128,30,16,16")),
+            ("bottom", crop("144,30,16,16")),
+            ("front", crop("128,46,16,16")),
+            ("back", crop("160,46,16,16")),
+            ("side", crop("112,46,16,16")),
+            ("snout_top", crop("192,44,12,16")),
+            ("snout_front", crop("192,60,12,5")),
+            ("snout_side", crop("176,60,16,5")),
+            ("jaw_front", crop("192,81,12,4")),
+            ("jaw_side", crop("176,81,16,4")),
+            ("jaw_bottom", crop("204,65,12,16")),
+        ];
+        let lift = if wall { 4 } else { 0 };
+        let snout = [("up", "snout_top"), ("down", "jaw_bottom"), ("north", "snout_front"), ("west", "snout_side"), ("east", "snout_side")];
+        let jaw = [("down", "jaw_bottom"), ("north", "jaw_front"), ("west", "jaw_side"), ("east", "jaw_side")];
+        let m = entity_model(
+            vec![
+                element([2, lift, 4], [14, lift + 12, 16], &BOX),
+                element([3, lift + 5, -5], [13, lift + 9, 4], &snout),
+                element([3, lift + 1, -5], [13, lift + 4, 4], &jaw),
+            ],
+            &tex,
+        );
+        return Some(if wall { walls(&m) } else { sixteenths(&m) });
+    }
+    // mob heads: the 8×8×8 head of the mob texture (piglin: 10 wide)
     let texture = match base {
         "skeleton" => "entity/skeleton/skeleton",
         "wither_skeleton" => "entity/skeleton/wither_skeleton",
@@ -974,20 +1168,108 @@ fn entity_models(short: &str) -> Option<Vec<(String, Vec<(Model, Applied)>)>> {
     } else {
         ([("top", crop("8,0,8,8")), ("bottom", crop("16,0,8,8")), ("front", crop("8,8,8,8")), ("back", crop("24,8,8,8")), ("side", crop("0,8,8,8"))], 4, 12)
     };
-    let mut out = vec![];
-    if wall {
-        // facing = where the face looks; the head hangs on the wall behind it
-        for (facing, y) in QUARTERS {
-            out.push((format!("facing={facing}"), vec![(model(cuboid([x0, 4, 8], [x1, 12, 16]), &tex), applied(y))]));
-        }
+    // facing = where the face looks; a wall head hangs on the wall behind it
+    Some(if wall {
+        walls(&entity_model(vec![element([x0, 4, 8], [x1, 12, 16], &BOX)], &tex))
     } else {
-        // rotation 0 looks south, 4 west, 8 north, 12 east (to the nearest quarter)
-        for r in 0..16 {
-            let y = [180, 270, 0, 90][((r + 2) / 4) % 4];
-            out.push((format!("rotation={r}"), vec![(model(cuboid([x0, 0, 4], [x1, 8, 12]), &tex), applied(y))]));
+        sixteenths(&entity_model(vec![element([x0, 0, 4], [x1, 8, 12], &BOX)], &tex))
+    })
+}
+
+/// Copper golem statues (`entity/copper_golem/<texture>`, 64×64): the golem 1.5 blocks tall in its
+/// four poses, looking towards `facing`. Built with the front on the north side; the poses are
+/// approximations of the game's (limbs turned about shoulder / hip; tilted boxes are moved, not
+/// tilted). 11 textures: top / side / bottom + 8 extra slots, so legs, arms and the antenna each
+/// share one side texture.
+fn copper_golem_statue(texture: &str) -> Vec<(String, Vec<(Model, Applied)>)> {
+    let crop = |rects: &str| format!("crop|entity/copper_golem/{texture}|64|{rects}");
+    let tex = [
+        ("top", crop("10,0,8,10")),
+        ("side", crop("0,21,6,6")),
+        ("bottom", crop("18,0,8,10")),
+        ("head_front", crop("10,10,8,5")),
+        ("head_back", crop("28,10,8,5")),
+        ("head_side", crop("0,10,10,5")),
+        ("body_front", crop("6,21,8,6")),
+        ("body_back", crop("20,21,8,6")),
+        ("leg", crop("4,31,4,5")),
+        ("arm", crop("40,20,3,10")),
+        ("antenna", crop("37,4,4,4")),
+    ];
+    let all = |t: &'static str| [("up", t), ("down", t), ("north", t), ("south", t), ("west", t), ("east", t)];
+    let head = [("up", "top"), ("down", "bottom"), ("north", "head_front"), ("south", "head_back"), ("west", "head_side"), ("east", "head_side")];
+    let body = [("up", "bottom"), ("down", "bottom"), ("north", "body_front"), ("south", "body_back"), ("west", "side"), ("east", "side")];
+    // a box turned by `angle` about `axis` through `origin` (see `model_parts`)
+    let turn = |mut e: Value, axis: &str, angle: f64, origin: [f64; 3]| {
+        e["rotation"] = serde_json::json!({"axis": axis, "angle": angle, "origin": origin});
+        e
+    };
+    let mut out = vec![];
+    for pose in ["standing", "sitting", "running", "star"] {
+        // upper body lowered while sitting (legs stretched forward on the ground)
+        let dy = if pose == "sitting" { -5 } else { 0 };
+        let shoulder = (12 + dy) as f64;
+        let mut els = vec![
+            element([4, 5 + dy, 5], [12, 11 + dy, 11], &body),
+            element([4, 11 + dy, 3], [12, 16 + dy, 13], &head),
+            element([7, 10 + dy, 2], [9, 13 + dy, 4], &all("antenna")),
+            element([7, 16 + dy, 7], [9, 20 + dy, 9], &all("antenna")),
+            element([6, 20 + dy, 6], [10, 24 + dy, 10], &all("antenna")),
+        ];
+        // arms (west, east) and legs (west, east)
+        let arms = [element([1, 2 + dy, 6], [4, 12 + dy, 10], &all("arm")), element([12, 2 + dy, 6], [15, 12 + dy, 10], &all("arm"))];
+        let legs = [element([4, 0, 6], [8, 5, 10], &all("leg")), element([8, 0, 6], [12, 5, 10], &all("leg"))];
+        match pose {
+            "sitting" => {
+                // arms forward onto the lap, legs lying forward
+                els.extend(arms.map(|a| turn(a, "x", 60.0, [8.0, shoulder, 8.0])));
+                els.extend([element([4, 0, 1], [8, 4, 6], &all("leg")), element([8, 0, 1], [12, 4, 6], &all("leg"))]);
+            }
+            "running" => {
+                // east arm and west leg forward (north), the others back
+                let [aw, ae] = arms;
+                let [lw, le] = legs;
+                els.extend([turn(aw, "x", -45.0, [2.5, shoulder, 8.0]), turn(ae, "x", 45.0, [13.5, shoulder, 8.0])]);
+                els.extend([turn(lw, "x", 30.0, [6.0, 5.0, 8.0]), turn(le, "x", -30.0, [10.0, 5.0, 8.0])]);
+            }
+            "star" => {
+                // arms raised to the sides, legs spread
+                let [aw, ae] = arms;
+                let [lw, le] = legs;
+                els.extend([turn(aw, "z", -135.0, [4.0, shoulder, 8.0]), turn(ae, "z", 135.0, [12.0, shoulder, 8.0])]);
+                els.extend([turn(lw, "z", -30.0, [8.0, 5.0, 8.0]), turn(le, "z", 30.0, [8.0, 5.0, 8.0])]);
+            }
+            _ => {
+                els.extend(arms);
+                els.extend(legs);
+            }
+        }
+        let m = entity_model(els, &tex);
+        for (facing, y) in QUARTERS {
+            out.push((format!("copper_golem_pose={pose},facing={facing}"), vec![(m.clone(), turned(0, y))]));
         }
     }
-    Some(out)
+    out
+}
+
+/// Entity parts drawn with a block that has a model in the jar: the bell itself in its frame (the
+/// same spot for every attachment). The bell texture is used without the usual entity flip, so
+/// its side rows run bottom to top (`v`).
+fn entity_extras(short: &str) -> Vec<(Model, Applied)> {
+    if short != "bell" {
+        return vec![];
+    }
+    let crop = |rects: &str| format!("crop|entity/bell/bell_body|32|{rects}");
+    let tex = [
+        ("bell_top", crop("12,0,6,6")),
+        ("bell_side", crop("0,6,6,7,v")),
+        ("lip_top", crop("16,13,8,8")),
+        ("lip_bottom", crop("8,13,8,8")),
+        ("lip_side", crop("0,21,8,2,v")),
+    ];
+    let body = [("up", "bell_top"), ("north", "bell_side"), ("south", "bell_side"), ("west", "bell_side"), ("east", "bell_side")];
+    let lip = [("up", "lip_top"), ("down", "lip_bottom"), ("north", "lip_side"), ("south", "lip_side"), ("west", "lip_side"), ("east", "lip_side")];
+    vec![(entity_model(vec![element([5, 6, 5], [11, 13, 11], &body), element([4, 4, 4], [12, 6, 12], &lip)], &tex), turned(0, 0))]
 }
 
 /// Average colour of the visible pixels and whether the texture has see-through pixels.
@@ -1077,8 +1359,8 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
     };
 
     let mut built: HashMap<String, Block> = HashMap::new();
-    let mut shapes: Vec<Vec<Vec<u8>>> = vec![vec![]];
-    let mut shape_ids: HashMap<Vec<Vec<u8>>, u32> = HashMap::new();
+    let mut shapes: Vec<Vec<Vec<i16>>> = vec![vec![]];
+    let mut shape_ids: HashMap<Vec<Vec<i16>>, u32> = HashMap::new();
     for path in jar.names("assets/minecraft/blockstates/", ".json") {
         let short = path.trim_start_matches("assets/minecraft/blockstates/").trim_end_matches(".json").to_string();
         let name = format!("minecraft:{short}");
@@ -1163,7 +1445,7 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
         }
         // detailed blocks: one entry per state, drawn from the model's boxes
         let entity = entity_models(&short);
-        if detailed(&short) || entity.is_some() {
+        if detailed(&short) || entity.is_some() || !entity_extras(&short).is_empty() {
             let states: Vec<(String, Vec<(Model, Applied)>)> = match entity {
                 Some(states) => states,
                 None => jar
@@ -1172,9 +1454,10 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|(key, applied)| {
-                        let models: Option<Vec<(Model, Applied)>> =
-                            applied.into_iter().map(|a| Some((load_model(&mut jar, &a.model)?, a))).collect();
-                        Some((key, models?))
+                        let mut models: Vec<(Model, Applied)> =
+                            applied.into_iter().map(|a| Some((load_model(&mut jar, &a.model)?, a))).collect::<Option<_>>()?;
+                        models.extend(entity_extras(&short));
+                        Some((key, models))
                     })
                     .collect(),
             };
@@ -1203,12 +1486,12 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
                         1
                     }
                 };
-                let mut all: Vec<Vec<u8>> = vec![];
+                let mut all: Vec<Vec<i16>> = vec![];
                 for (m, a) in with_models {
                     all.extend(model_parts(m, a, &mut slot));
                 }
                 // the same box from several model parts (pane posts): one box with all their faces
-                let mut parts: Vec<Vec<u8>> = vec![];
+                let mut parts: Vec<Vec<i16>> = vec![];
                 for p in all {
                     match parts.iter_mut().find(|q| q[..6] == p[..6]) {
                         Some(q) => {
@@ -1224,11 +1507,12 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
                 if parts.is_empty() {
                     continue;
                 }
-                let mut bbox = [16, 16, 16, 0, 0, 0];
+                // the block's own box (parts reaching out of it are cut)
+                let mut bbox = [16u8, 16, 16, 0, 0, 0];
                 for p in &parts {
                     for i in 0..3 {
-                        bbox[i] = bbox[i].min(p[i]);
-                        bbox[i + 3] = bbox[i + 3].max(p[i + 3]);
+                        bbox[i] = bbox[i].min(p[i].clamp(0, 16) as u8);
+                        bbox[i + 3] = bbox[i + 3].max(p[i + 3].clamp(0, 16) as u8);
                     }
                 }
                 let shape = *shape_ids.entry(parts.clone()).or_insert_with(|| {
@@ -1273,7 +1557,7 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
             let default_key = per_state.first().map(|(key, _)| {
                 key.split(',')
                     .filter_map(|kv| kv.split_once('='))
-                    .map(|(k, _)| format!("{k}={}", default_value(k, &values[k])))
+                    .map(|(k, _)| format!("{k}={}", default_value(&name, k, &values[k])))
                     .collect::<Vec<_>>()
                     .join(",")
             });
@@ -1338,8 +1622,34 @@ fn build(jar_path: &Path, stamp: String, old: Registry, out: &Path) -> Result<Re
     biomes.extend(rest);
     biomes.truncate(256);
 
+    // ----- block entity decorations (drawn by the viewer over the block models) -----
+    // banner patterns: white masks of the flag's front and back (dye colour applied by the viewer)
+    let mut patterns = BTreeMap::new();
+    for path in jar.names("data/minecraft/banner_pattern/", ".json") {
+        let id = format!("minecraft:{}", path.trim_start_matches("data/minecraft/banner_pattern/").trim_end_matches(".json"));
+        let Some(asset) = jar.json(&path).and_then(|v| v.get("asset_id")?.as_str().map(str::to_string)) else { continue };
+        let (ns, name) = asset.split_once(':').unwrap_or(("minecraft", &asset));
+        if ns != "minecraft" {
+            continue;
+        }
+        let crop = |rect: &str| format!("crop|entity/banner/{name}|64|{rect}");
+        let (Some(front), Some(back)) = (texture(&mut jar, &crop("1,1,20,40")), texture(&mut jar, &crop("22,1,20,40"))) else { continue };
+        patterns.insert(id, [front.0, back.0]);
+        patterns.insert(asset.clone(), [front.0, back.0]);
+    }
+    // pottery sherds: item "minecraft:<x>_pottery_sherd" -> decorated_pot_pattern/<x> -> its texture
+    let mut sherds = BTreeMap::new();
+    for path in jar.names("data/minecraft/decorated_pot_pattern/", ".json") {
+        let short = path.trim_start_matches("data/minecraft/decorated_pot_pattern/").trim_end_matches(".json").to_string();
+        let Some(asset) = jar.json(&path).and_then(|v| v.get("asset_id")?.as_str().map(str::to_string)) else { continue };
+        let name = asset.trim_start_matches("minecraft:");
+        if let Some(t) = texture(&mut jar, &format!("entity/decorated_pot/{name}")) {
+            sherds.insert(format!("minecraft:{short}_pottery_sherd"), t.0);
+        }
+    }
+
     write_atlas(&out.join("atlas.png"), &atlas).map_err(|e| format!("atlas: {e}"))?;
-    Ok(Registry { client: stamp, blocks, biomes, shapes })
+    Ok(Registry { client: stamp, blocks, biomes, shapes, patterns, sherds })
 }
 
 fn write_atlas(path: &Path, textures: &[Vec<u8>]) -> std::io::Result<()> {
@@ -1378,7 +1688,7 @@ mod tests {
     }
 
     fn rot(y: i64, uvlock: bool) -> Applied {
-        Applied { model: String::new(), x: 0, y, uvlock }
+        Applied { model: String::new(), x: 0, y, uvlock, free: false }
     }
 
     #[test]
@@ -1411,11 +1721,19 @@ mod tests {
     #[test]
     fn default_values_of_missing_properties() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert_eq!(default_value("facing", &v(&["east", "north", "south", "west"])), "north");
-        assert_eq!(default_value("shape", &v(&["inner_left", "straight"])), "straight");
-        assert_eq!(default_value("open", &v(&["true", "false"])), "false");
-        assert_eq!(default_value("up", &v(&["false", "true"])), "true");
-        assert_eq!(default_value("power", &v(&["3", "0"])), "3");
+        assert_eq!(default_value("stairs", "facing", &v(&["east", "north", "south", "west"])), "north");
+        assert_eq!(default_value("stairs", "shape", &v(&["inner_left", "straight"])), "straight");
+        assert_eq!(default_value("door", "open", &v(&["true", "false"])), "false");
+        assert_eq!(default_value("wall", "up", &v(&["false", "true"])), "true");
+        assert_eq!(default_value("x", "power", &v(&["3", "0"])), "3");
+        // as the server's reports have them
+        let sixteen: Vec<String> = (0..16).map(|r| r.to_string()).collect();
+        assert_eq!(default_value("minecraft:white_banner", "rotation", &sixteen), "8");
+        assert_eq!(default_value("minecraft:oak_sign", "rotation", &sixteen), "8");
+        assert_eq!(default_value("minecraft:player_head", "rotation", &sixteen), "0");
+        assert_eq!(default_value("minecraft:chest", "type", &v(&["left", "right", "single"])), "single");
+        assert_eq!(default_value("minecraft:red_bed", "part", &v(&["head", "foot"])), "foot");
+        assert_eq!(default_value("minecraft:redstone_torch", "lit", &v(&["false", "true"])), "true");
     }
 
     #[test]
@@ -1441,7 +1759,7 @@ mod tests {
         // facing north = y 270: step on the north half; its west face now faces south
         let p = model_parts(&stairs, &rot(270, true), |_| 0);
         assert_eq!(p[1][..6], [0, 8, 0, 16, 16, 8]);
-        let face = |part: &Vec<u8>, dir: usize| part[6 + dir * 5..6 + dir * 5 + 5].to_vec();
+        let face = |part: &Vec<i16>, dir: usize| part[6 + dir * 5..6 + dir * 5 + 5].to_vec();
         assert_eq!(face(&p[1], WEST), vec![NO_FACE; 5]);
         // uvlock: texture follows the world position (south face: u = x, v = 16 - y)
         assert_eq!(face(&p[1], SOUTH), vec![0, 0, 16, 8, 0]);
@@ -1458,10 +1776,10 @@ mod tests {
             json!({"torch": "block/torch"}));
         let p = model_parts(&torch, &rot(0, false), |_| 0);
         // leaning away from the wall (west): three pieces, each a bit further east, inside the block
-        let boxes: Vec<&[u8]> = p.iter().map(|p| &p[..6]).collect();
+        let boxes: Vec<&[i16]> = p.iter().map(|p| &p[..6]).collect();
         assert_eq!(boxes, [[0, 3, 7, 2, 7, 9], [1, 6, 7, 3, 10, 9], [2, 10, 7, 4, 13, 9]]);
         // each piece shows its share of the side texture, only the top piece has the top
-        let north: Vec<&[u8]> = p.iter().map(|p| &p[6 + NORTH * 5..6 + NORTH * 5 + 4]).collect();
+        let north: Vec<&[i16]> = p.iter().map(|p| &p[6 + NORTH * 5..6 + NORTH * 5 + 4]).collect();
         assert_eq!(north, [[7, 13, 9, 16], [7, 9, 9, 13], [7, 6, 9, 9]]);
         assert_eq!(p.iter().filter(|p| p[6 + UP * 5] != NO_FACE).count(), 1);
         assert_eq!(p[2][6 + UP * 5..6 + UP * 5 + 4], [7, 6, 9, 8]);
@@ -1494,8 +1812,62 @@ mod tests {
         let wall = entity_models("zombie_wall_head").unwrap();
         let (m, a) = &wall[1].1[0];
         assert_eq!(model_parts(m, a, |_| 0)[0][..6], [0, 4, 4, 8, 12, 12]);
-        assert!(entity_models("dragon_head").is_none());
         assert!(entity_models("stone").is_none());
+        assert!(entity_models("pink_shulker_box_x").is_none());
+    }
+
+    #[test]
+    fn other_entity_blocks() {
+        let parts = |m: &Model, a: &Applied| model_parts(m, a, |_| 0);
+        // shulker boxes: a full cube in six facings, the lid side band over the base
+        let shulker = entity_models("light_blue_shulker_box").unwrap();
+        assert_eq!(shulker.len(), 6);
+        assert!(shulker[0].1[0].0.textures["side"].starts_with("crop|entity/shulker/shulker_light_blue|64|"));
+        assert_eq!(parts(&shulker[3].1[0].0, &shulker[3].1[0].1)[0][..6], [0, 0, 0, 16, 16, 16]);
+        assert!(entity_models("shulker_box").unwrap()[0].1[0].0.textures["top"].starts_with("crop|entity/shulker/shulker|"));
+        // banners: flag in the dye colour; the standing one reaches above its block, the wall one below
+        let banner = entity_models("red_banner").unwrap();
+        assert_eq!(banner.len(), 16);
+        assert!(banner[0].1[0].0.textures["flag"].ends_with("|*b02e26"));
+        assert_eq!(parts(&banner[8].1[0].0, &banner[8].1[0].1)[1][4], 30);
+        let wall = entity_models("black_wall_banner").unwrap();
+        let p = parts(&wall[0].1[0].0, &wall[0].1[0].1);
+        assert_eq!(p[0][..6], [1, -13, 13, 15, 12, 14]);
+        assert!(entity_models("purple_glazed_banner").is_none());
+        // dragon heads: the snout sticks out of the block in front (rotation 8: north)
+        let dragon = entity_models("dragon_head").unwrap();
+        let p = parts(&dragon[8].1[0].0, &dragon[8].1[0].1);
+        assert_eq!(p[1][2], -5);
+        assert_eq!(entity_models("dragon_wall_head").unwrap().len(), 4);
+        // one entry without properties
+        assert_eq!(entity_models("conduit").unwrap()[0].0, "active=false");
+        let pot = entity_models("decorated_pot").unwrap();
+        assert_eq!((pot.len(), pot[1].0.as_str()), (4, "facing=east"));
+        assert_eq!(pot[0].1[0].0.elements.len(), 2);
+        // copper golem statues: 4 poses × 4 facings, standing first (the default state)
+        let golem = entity_models("waxed_weathered_copper_golem_statue").unwrap();
+        assert_eq!(golem.len(), 16);
+        assert_eq!(golem[0].0, "copper_golem_pose=standing,facing=north");
+        assert!(golem[0].1[0].0.textures["top"].starts_with("crop|entity/copper_golem/copper_golem_weathered|64|"));
+        assert!(entity_models("copper_golem_statue").unwrap()[0].1[0].0.textures["top"].starts_with("crop|entity/copper_golem/copper_golem|"));
+        assert!(entity_models("rusty_copper_golem_statue").is_none());
+        let p = parts(&golem[0].1[0].0, &golem[0].1[0].1);
+        assert_eq!(p.iter().map(|q| q[4]).max(), Some(24)); // 1.5 blocks tall
+        assert_eq!(p[2][..6], [7, 10, 2, 9, 13, 4]); // the nose in front (north)
+        // facing east: the nose on the east side
+        let p = parts(&golem[1].1[0].0, &golem[1].1[0].1);
+        assert_eq!(p[2][3], 14);
+        // star: the raised arms reach above the shoulders
+        let star = parts(&golem[12].1[0].0, &golem[12].1[0].1);
+        assert!(star.len() > p.len() && star.iter().any(|q| q[0] < 1 && q[4] > 14));
+        // the bell is added to its frame; nothing for other blocks
+        assert_eq!(entity_extras("bell")[0].0.elements.len(), 2);
+        assert!(entity_extras("chest").is_empty());
+    }
+
+    #[test]
+    fn tinted_crop_spec() {
+        assert_eq!(hex("*b02e26".strip_prefix('*')), Some([0xb0, 0x2e, 0x26]));
     }
 
     #[test]

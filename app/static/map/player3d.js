@@ -97,6 +97,59 @@ export function playerModel(url, onReady) {
   return group;
 }
 
+// ---------- player heads placed in the world ----------
+// mapgen draws every player head with Steve's face; heads with a skin of their own (heads.json)
+// get this box over it: the skin's head (+ hat layer), a little larger than the block model.
+
+const headSkins = new Map(); // url -> Promise<material | null>, shared by all heads with that skin
+
+function headMaterial(url) {
+  if (!headSkins.has(url)) {
+    headSkins.set(url, new Promise((resolve) => {
+      loader.load(url, (tex) => {
+        tex.magFilter = THREE.NearestFilter;
+        tex.minFilter = THREE.NearestFilter;
+        tex.generateMipmaps = false;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        const img = tex.image;
+        let hat = img.height === 64;
+        if (!hat) {
+          // old skins often fill the hat layer with solid colour, which the game ignores
+          const c = document.createElement("canvas");
+          c.width = img.width;
+          c.height = img.height;
+          const ctx = c.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(img, 0, 0);
+          const a = ctx.getImageData(40, 8, 8, 8).data;
+          for (let i = 3; i < a.length; i += 4) if (a[i] < 255) hat = true;
+        }
+        const material = new THREE.MeshBasicMaterial({ map: tex, vertexColors: true, alphaTest: 0.5, side: THREE.DoubleSide });
+        resolve({ material, hat, size: [img.width, img.height] });
+      }, undefined, () => resolve(null));
+    }));
+  }
+  return headSkins.get(url);
+}
+
+/** A placed player head: group centred on the head, face towards +z, in block units. Empty until
+ *  the skin is loaded (and when there is none: then the map's Steve head stays visible). */
+export function headModel(url, onReady) {
+  const group = new THREE.Group();
+  group.scale.setScalar(1 / 16);
+  headMaterial(url).then((skin) => {
+    if (!skin) return;
+    group.add(new THREE.Mesh(box(8, 8, 8, [0, 0], skin.size, 0.1), skin.material));
+    if (skin.hat) group.add(new THREE.Mesh(box(8, 8, 8, [32, 0], skin.size, 0.6), skin.material));
+    onReady?.();
+  });
+  return group;
+}
+
+/** Free a head (its skin material stays for the other heads). */
+export function disposeHead(group) {
+  group.traverse((o) => o.geometry?.dispose());
+}
+
 /** Free the GPU resources of a model. */
 export function disposeModel(group) {
   const mats = new Set();

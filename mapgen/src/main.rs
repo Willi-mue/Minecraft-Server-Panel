@@ -216,6 +216,8 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
                         let _ = fs::remove_file(tiles::plant_path(&dim_dir, x, z));
                         let _ = fs::remove_file(tiles::voxel_path(&dim_dir, x, z));
                         let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
+                        let _ = fs::remove_file(tiles::head_path(&dim_dir, x, z));
+                        let _ = fs::remove_file(tiles::decor_path(&dim_dir, x, z));
                         return Ok(0);
                     }
                     tiles::write_rgba(&tiles::tile_path(&dim_dir, 0, x, z), &img.rgba)?;
@@ -244,6 +246,16 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
                             let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
                         }
                     }
+                    if img.heads.is_empty() {
+                        let _ = fs::remove_file(tiles::head_path(&dim_dir, x, z));
+                    } else {
+                        tiles::write_bytes(&tiles::head_path(&dim_dir, x, z), &serde_json::to_vec(&img.heads).unwrap_or_default())?;
+                    }
+                    if img.decor.is_empty() {
+                        let _ = fs::remove_file(tiles::decor_path(&dim_dir, x, z));
+                    } else {
+                        tiles::write_bytes(&tiles::decor_path(&dim_dir, x, z), &serde_json::to_vec(&img.decor).unwrap_or_default())?;
+                    }
                     Ok(img.chunks)
                 })
                 .map_err(|e| format!("r.{x}.{z}.mca: {e}"));
@@ -258,6 +270,8 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
         let _ = fs::remove_file(tiles::plant_path(&dim_dir, x, z));
         let _ = fs::remove_file(tiles::voxel_path(&dim_dir, x, z));
         let _ = fs::remove_file(tiles::cave_path(&dim_dir, x, z));
+        let _ = fs::remove_file(tiles::head_path(&dim_dir, x, z));
+        let _ = fs::remove_file(tiles::decor_path(&dim_dir, x, z));
     }
 
     // The top chunk row of the region south of a changed one is shaded against it: patch it
@@ -343,6 +357,8 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
 
     let _ = fs::create_dir_all(&dim_dir);
     let _ = fs::write(&state_path, serde_json::to_vec(&new_state).unwrap_or_default());
+    merge::<render::HeadOut>(&dim_dir, "k", "heads.json");
+    merge::<render::DecorOut>(&dim_dir, "d", "decor.json");
 
     let bounds = (!present.is_empty()).then(|| {
         [
@@ -363,6 +379,22 @@ fn process(dim: &Dimension, out: &Path, force: bool, assets: Option<&assets::Ass
         levels,
         bounds,
     }
+}
+
+/// One list per dimension for the 3D viewer from the per-region lists in `dir`: `heads.json`
+/// (player heads, `k/`) and `decor.json` (banner patterns, pot sherds, `d/`).
+fn merge<T: Serialize + serde::de::DeserializeOwned>(dim_dir: &Path, dir: &str, file: &str) {
+    let mut all: Vec<T> = vec![];
+    if let Ok(entries) = fs::read_dir(dim_dir.join(dir)) {
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for f in files {
+            if let Some(list) = fs::read(&f).ok().and_then(|b| serde_json::from_slice::<Vec<T>>(&b).ok()) {
+                all.extend(list);
+            }
+        }
+    }
+    let _ = tiles::write_bytes(&dim_dir.join(file), &serde_json::to_vec(&all).unwrap_or_default());
 }
 
 #[derive(Serialize)]
