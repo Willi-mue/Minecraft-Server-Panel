@@ -1087,6 +1087,21 @@ async fn list_datapacks(Path(sid): Path<String>) -> ApiResult {
     packs(&server(&sid)?).await
 }
 
+/// pack.png of a data pack (the list says `icon: true` when there is one).
+async fn datapack_icon(Path((sid, name)): Path<(String, String)>) -> ApiResult {
+    let m = server(&sid)?;
+    let inst = m.inst.clone();
+    let data = blocking(move || datapacks::icon(&inst, &name)).await??;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "private, max-age=300"),
+        ],
+        data,
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 struct NameQuery {
     name: String,
@@ -1618,6 +1633,7 @@ pub fn router() -> Router {
         .route("/world/new", post(new_world))
         .route("/datapacks", get(list_datapacks))
         .route("/datapacks/upload", post(upload_datapack))
+        .route("/datapacks/{name}/icon", get(datapack_icon))
         .route("/datapacks/{name}/install", post(install_datapack))
         .route("/datapacks/{name}/adopt", post(adopt_datapack))
         .route("/datapacks/{name}/enabled", post(toggle_datapack))

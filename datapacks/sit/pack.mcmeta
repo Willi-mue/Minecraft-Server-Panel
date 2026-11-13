@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Mit leerer Hand auf eine Treppe oder Stufe rechtsklicken und Platz nehmen. Schleichen zum Aufstehen.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Sitzplätze",
+    "category": "Bauen & Deko"
+  }
+}

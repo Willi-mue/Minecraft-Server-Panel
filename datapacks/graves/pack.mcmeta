@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Wenn du stirbst, kommen deine Items in ein Grab mit deinem Kopf am Todesort. Rechtsklick auf das Grab holt sie zurück – nur du kannst es öffnen, und nichts verschwindet nach 5 Minuten.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Grabsteine",
+    "category": "Komfort"
+  }
+}

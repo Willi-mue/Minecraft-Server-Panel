@@ -751,7 +751,17 @@ pub fn validate_project(project_id: &str) -> Result<&str> {
     Ok(project_id)
 }
 
+/// Modrinth is only used for Fabric mods; plugins are uploaded by hand and the panel never
+/// contacts Modrinth for them (decision 2026-11-13).
+fn modrinth_allowed(kind: &str) -> Result<()> {
+    if kind != "mods" {
+        return invalid!("Plugins are not looked up on Modrinth: upload the .jar instead");
+    }
+    Ok(())
+}
+
 pub fn search(kind: &str, game_version: &str, query: &str, offset: i64) -> Result<Value> {
+    modrinth_allowed(kind)?;
     let query: String = query.trim().chars().take(100).collect();
     let mut facets: Vec<Vec<String>> = vec![vec![
         "server_side:required".into(),
@@ -887,6 +897,7 @@ pub fn install(
     project_id: &str,
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<Vec<String>> {
+    modrinth_allowed(kind)?;
     let base = folder(inst, kind)?;
     let local_files = files(inst, kind);
     let local_hashes: HashSet<String> = local_files.iter().map(|p| sha512(p)).collect();
@@ -950,6 +961,7 @@ fn update_query(hashes: Vec<String>, kind: &str, game_version: &str) -> Value {
 
 /// {file: {"version": "1.2.3", "filename": ...}} for files Modrinth has a newer version of.
 pub fn check_updates(inst: &Instance, kind: &str, game_version: &str) -> Result<Value> {
+    modrinth_allowed(kind)?;
     let local: Vec<(String, String)> = files(inst, kind)
         .iter()
         .map(|p| (file_name(p), sha512(p)))
@@ -988,6 +1000,7 @@ pub fn update(
     name: &str,
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<String> {
+    modrinth_allowed(kind)?;
     let path = path_of(inst, kind, name)?;
     let h = sha512(&path);
     let answer = api_post(
@@ -1212,6 +1225,18 @@ mod tests {
         add_upload(&inst, "mods", "x.jar", &up).unwrap();
         fs::write(&up, b"no zip").unwrap();
         assert!(add_upload(&inst, "mods", "y.jar", &up).is_err());
+    }
+
+    #[test]
+    fn plugins_never_use_modrinth() {
+        // Refused before any request is made (works offline)
+        assert!(matches!(search("plugins", "26.3", "", 0), Err(Error::Invalid(_))));
+        let _g = crate::testutil::data_dir();
+        let inst = Instance::main();
+        let noop = |_: &str| {};
+        assert!(matches!(install(&inst, "plugins", "26.3", "abc", &noop), Err(Error::Invalid(_))));
+        assert!(matches!(check_updates(&inst, "plugins", "26.3"), Err(Error::Invalid(_))));
+        assert!(matches!(update(&inst, "plugins", "26.3", "x.jar", &noop), Err(Error::Invalid(_))));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+execute store result score #r deaths.tmp run random value 1..5
+execute if score #r deaths.tmp matches 1 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " underestimated gravity.", color: "gray"}]
+execute if score #r deaths.tmp matches 1 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " hat die Schwerkraft unterschätzt.", color: "gray"}]
+execute if score #r deaths.tmp matches 2 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " tried to fly. The ground disagreed.", color: "gray"}]
+execute if score #r deaths.tmp matches 2 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " wollte fliegen. Der Boden hatte andere Pläne.", color: "gray"}]
+execute if score #r deaths.tmp matches 3 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " took the shortcut down.", color: "gray"}]
+execute if score #r deaths.tmp matches 3 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " hat den kürzesten Weg nach unten genommen.", color: "gray"}]
+execute if score #r deaths.tmp matches 4 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {text: "New free-fall record: ", color: "gray"}, {selector: "@s", color: "gold"}, {text: "!", color: "gray"}]
+execute if score #r deaths.tmp matches 4 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {text: "Neuer Rekord im Freifall: ", color: "gray"}, {selector: "@s", color: "gold"}, {text: "!", color: "gray"}]
+execute if score #r deaths.tmp matches 5 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " forgot that water at the bottom helps.", color: "gray"}]
+execute if score #r deaths.tmp matches 5 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " hat vergessen, dass unten Wasser hilfreich wäre.", color: "gray"}]

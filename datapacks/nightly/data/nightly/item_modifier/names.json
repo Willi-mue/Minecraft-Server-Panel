@@ -1,0 +1,6 @@
+{
+  "type": "minecraft:set_name",
+  "name": { "selector": "@a[tag=nightly.best]" },
+  "entity": "this",
+  "target": "custom_name"
+}

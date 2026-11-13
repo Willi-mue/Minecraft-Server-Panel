@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Lustige Todesmeldungen passend zur Todesursache für alle, und für dich der genaue Todesort zum Anklicken.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Todesbote",
+    "category": "Spaß"
+  }
+}

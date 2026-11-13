@@ -1,0 +1,11 @@
+{
+  "criteria": {
+    "use": {
+      "trigger": "minecraft:using_item",
+      "conditions": {
+        "item": { "items": "#minecraft:hoes" }
+      }
+    }
+  },
+  "rewards": { "function": "harvest:use" }
+}

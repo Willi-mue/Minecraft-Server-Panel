@@ -16,7 +16,15 @@ Zurzeit nichts.
 
 ## Später (Optimierungen)
 
-- [ ] Chunk-genaues inkrementelles Rendern
+- [ ] Chunk-genaues inkrementelles Rendern — **zurückgestellt, lohnt sich zurzeit nicht** (Messung 2026-11-13)
+  - Messung an der echten Welt (`data/server`, 34 Overworld-Regionen, Zeitstempel-Tabellen der `.mca`):
+    die letzten Speichervorgänge schrieben 101 Chunks in 2 Regionen, 262 in 4 und 1254 in 4 Regionen.
+    Neu zu berechnen wären davon (Rand 3 Chunks bei `reach` 32) 17–46 % pro betroffener Region,
+    einzulesen 40–90 % (inkl. Nachbarregionen). Geschätzte Ersparnis ~40–60 % pro Region.
+  - Absolut: 4 Regionen neu rendern = 3,9 s mit 1 Thread, 2,5 s mit 2 (`MAP_THREADS`-Default), ohne Änderung 33 ms;
+    volle Welt 17,5 s. Ein Autosave (alle 5 min) kostet also ~1–2,5 s CPU bei niedriger Priorität.
+    Die Ersparnis (~1 s pro Autosave) rechtfertigt das Flicken von `v/`/`c/`/`b/`/`p/`/Köpfen/Decor nicht.
+  - Wieder aufgreifen, wenn Welten deutlich größer/dichter werden oder viele Server gleichzeitig rendern.
   - Messung (2026-11-10, 1 Thread, volle Region): Chunks lesen ~25 %, 2D-Kacheln ~3 %, 3D-Stapel (`voxels`) ~70 %.
     Nur die 2D-Kacheln chunkweise zu flicken spart daher fast nichts.
   - Approach: Für die 3D-Stapel hängt eine Spalte von allem in `reach + 1` Spalten ab: neu zu berechnen ist

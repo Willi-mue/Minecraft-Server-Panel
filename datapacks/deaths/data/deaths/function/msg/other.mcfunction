@@ -1,0 +1,11 @@
+execute store result score #r deaths.tmp run random value 1..5
+execute if score #r deaths.tmp matches 1 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " passed away mysteriously.", color: "gray"}]
+execute if score #r deaths.tmp matches 1 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " ist auf mysteriöse Weise verschieden.", color: "gray"}]
+execute if score #r deaths.tmp matches 2 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " kicked the bucket.", color: "gray"}]
+execute if score #r deaths.tmp matches 2 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " hat das Zeitliche gesegnet.", color: "gray"}]
+execute if score #r deaths.tmp matches 3 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " is taking a short break. A very long one.", color: "gray"}]
+execute if score #r deaths.tmp matches 3 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " macht jetzt eine kleine Pause. Eine sehr lange.", color: "gray"}]
+execute if score #r deaths.tmp matches 4 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {text: "Rest in peace, ", color: "gray"}, {selector: "@s", color: "gold"}, {text: ". Or just respawn.", color: "gray"}]
+execute if score #r deaths.tmp matches 4 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {text: "Ruhe in Frieden, ", color: "gray"}, {selector: "@s", color: "gold"}, {text: ". Oder einfach respawnen.", color: "gray"}]
+execute if score #r deaths.tmp matches 5 run tellraw @a[scores={lang.de=0}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " booked a trip to the afterlife.", color: "gray"}]
+execute if score #r deaths.tmp matches 5 run tellraw @a[scores={lang.de=1}] [{text: "☠ ", color: "dark_gray"}, {selector: "@s", color: "gold"}, {text: " hat einen Ausflug ins Jenseits gebucht.", color: "gray"}]

@@ -5,13 +5,30 @@ Die Live-Map hat eigene Listen: [TODO_LIVEMAP.md](TODO_LIVEMAP.md), [DEV_TODO_LI
 
 **Zuständigkeit** (damit zwei Claudes parallel arbeiten können): `panel/` außer `panel/src/livemap.rs`,
 `mapserver.rs`, `leaderboard.rs`, `waypoints.rs`; `app/static/` außer `app/static/map/`; außerdem
-`docker/`. `mapgen/` nicht anfassen. Gemeinsam genutzte Dateien (`panel/src/main.rs`, `api.rs`,
+`docker/` und `datapacks/`. `mapgen/` nicht anfassen. Gemeinsam genutzte Dateien (`panel/src/main.rs`, `api.rs`,
 `server.rs`, `config.rs`, `tasks.rs`, `Dockerfile`, `docker-compose*.yml`, `README.md`, `CLAUDE.md`) nur
 gezielt und klein ändern und direkt vorher neu lesen – dort arbeitet evtl. gleichzeitig die Live-Map-Seite.
 
 ## Offen
 
-- [ ] Eigene Datapacks: Quellordner im Repo (optional)
-  - Entscheidung 2026-11-10: Kein Editor im Panel. Datapacks schreibt der Entwickler zusammen mit Claude; im Panel sollen sie wie die anderen Packs installier- und umschaltbar sein. Das geht schon: ein Ordner-Pack (mit `pack.mcmeta`) in `DATA_DIR/datapacks/<name>/` erscheint in der Bibliothek, „Install“/Ein/Aus wie gewohnt, nach Änderungen zeigt das Panel „outdated“ → Update (+ `/reload` beim Umschalten).
-  - Offen: `data/` ist in `.gitignore`, eigene Packs wären also nicht versioniert. Vorschlag: Quellen in `datapacks/` im Repo, das Panel liest diesen Ordner als zweite Bibliotheksquelle (z. B. `DATAPACK_SRC`, im Docker-Compose read-only gemountet) oder ein kleines Sync-Skript kopiert sie nach `DATA_DIR/datapacks/`. Erst umsetzen, wenn das erste eigene Pack entsteht.
-  - Touches: `panel/src/datapacks.rs`, `panel/src/config.rs`, `docker-compose*.yml`, README
+- [ ] Feuerwerk bei Advancements
+  - Bei jedem Advancement ein Feuerwerk über dem Spieler, bei Challenges ein großes (mehrere Raketen, Farben).
+  - Datapacks haben keinen Trigger „irgendein Advancement“ (nur pro Advancement über `rewards.function`, dafür
+    müsste man alle Vanilla-Advancements überschreiben → bricht bei Updates). Vorschlag: im Panel —
+    `server.rs` erkennt schon Konsolenzeilen; neue Regex für „has made the advancement“ / „has reached the goal“ /
+    „has completed the challenge“, dann `execute at <name> run summon firework_rocket …` (Name validiert,
+    Befehl serverseitig gebaut). Braucht die Spielregel `announceAdvancements` (Default an); Schalter in den
+    Panel-Einstellungen pro Server.
+  - Eigene Server-Advancements können es zusätzlich direkt per `rewards.function` auslösen.
+- [ ] Mods-/Plugins-Seite: Ladeanzeige während einer Aktion wie bei den Datapacks (`packBusy` in app.js) —
+  bisher passiert bis zur Antwort sichtbar nichts.
+
+## Eigene Datapacks
+
+Quellen in `datapacks/` (Aufbau, Konventionen, Tests: [datapacks/README.md](datapacks/README.md)); Ideen und
+Entscheidungen: [DEV_TODO_DASHBOARD.md](DEV_TODO_DASHBOARD.md) → „Datapack-Ideen“. Als Nächstes: das Event-Pack.
+
+- [ ] Optional: Grab-Wegpunkt auf der Live-Map („Grab von <Name>“). Datapacks können keine Dateien schreiben →
+  das Panel müsste eine Chat-/Log-Zeile erkennen (ähnlich `LOGIN_RE`) und `waypoints.rs` nutzen (Live-Map-Seite).
+- [ ] Optional: zweite Bibliotheksquelle im Panel (`DATAPACK_SRC`, read-only gemountet), falls das Kopieren von
+  `datapacks/` nach `data/datapacks/` nervt.

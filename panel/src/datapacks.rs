@@ -90,18 +90,57 @@ fn text(desc: &Value) -> String {
     }
 }
 
-fn mcmeta(path: &Path) -> Option<Value> {
-    let raw = if path.is_dir() {
-        fs::read(path.join("pack.mcmeta")).ok()?
+/// A file at the top of a folder or zip pack, at most `limit` bytes.
+fn read_top(path: &Path, name: &str, limit: u64) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    if path.is_dir() {
+        fs::File::open(path.join(name))
+            .ok()?
+            .take(limit + 1)
+            .read_to_end(&mut buf)
+            .ok()?;
     } else {
         let mut zf = zip::ZipArchive::new(fs::File::open(path).ok()?).ok()?;
-        let mut f = zf.by_name("pack.mcmeta").ok()?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).ok()?;
-        buf
-    };
+        let f = zf.by_name(name).ok()?;
+        f.take(limit + 1).read_to_end(&mut buf).ok()?;
+    }
+    (buf.len() as u64 <= limit).then_some(buf)
+}
+
+fn mcmeta(path: &Path) -> Option<Value> {
+    let raw = read_top(path, "pack.mcmeta", 1024 * 1024)?;
     let meta: Value = serde_json::from_slice(strip_bom(&raw)).ok()?;
     meta.is_object().then_some(meta)
+}
+
+const ICON_LIMIT: u64 = 512 * 1024;
+
+fn has_icon(path: &Path) -> bool {
+    if path.is_dir() {
+        return path.join("pack.png").is_file();
+    }
+    fs::File::open(path)
+        .ok()
+        .and_then(|f| zip::ZipArchive::new(f).ok())
+        .is_some_and(|mut z| z.by_name("pack.png").is_ok())
+}
+
+/// The pack's pack.png (library copy first, else the world's), only if it really is a PNG.
+pub fn icon(inst: &Instance, name: &str) -> Result<Vec<u8>> {
+    let path = library_path(name).or_else(|_| path_of(inst, name))?;
+    match read_top(&path, "pack.png", ICON_LIMIT) {
+        Some(data) if data.starts_with(b"\x89PNG\r\n\x1a\n") => Ok(data),
+        _ => Err(Error::NotFound(format!("{name} has no icon"))),
+    }
+}
+
+/// Optional `"panel": {"title", "category"}` section of pack.mcmeta (ignored by Minecraft).
+fn panel_field(meta: Option<&Value>, key: &str) -> String {
+    meta.and_then(|m| m.get("panel"))
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().chars().take(60).collect())
+        .unwrap_or_default()
 }
 
 fn files(path: &Path) -> Vec<PathBuf> {
@@ -273,6 +312,9 @@ pub fn list_packs(inst: &Instance) -> Value {
                     _ => false,
                 },
                 "valid": meta.is_some(),
+                "title": panel_field(meta.as_ref(), "title"),
+                "category": panel_field(meta.as_ref(), "category"),
+                "icon": has_icon(src),
                 "description": desc.chars().take(300).collect::<String>(),
                 "size_kb": (size(src) as f64 / 1024.0).round() as u64,
             })
@@ -537,5 +579,32 @@ mod tests {
             vec!["mypack"]
         );
         assert!(library().join("mypack/pack.mcmeta").is_file());
+    }
+
+    #[test]
+    fn title_category_icon() {
+        let _t = crate::testutil::data_dir();
+        let inst = Instance::main();
+        let p = library().join("nice");
+        fs::create_dir_all(p.join("data")).unwrap();
+        fs::write(
+            p.join("pack.mcmeta"),
+            r#"{"pack": {"description": "d"}, "panel": {"title": " Nice Pack ", "category": "Komfort"}}"#,
+        )
+        .unwrap();
+        assert!(icon(&inst, "nice").is_err(), "no pack.png yet");
+        fs::write(p.join("pack.png"), b"not a png").unwrap();
+        assert!(icon(&inst, "nice").is_err(), "only real PNGs");
+        fs::write(p.join("pack.png"), b"\x89PNG\r\n\x1a\nrest").unwrap();
+        assert!(icon(&inst, "nice").unwrap().starts_with(b"\x89PNG"));
+        assert!(icon(&inst, "../nice").is_err());
+        pack_zip(&library().join("plain.zip"), Some(r#"{"pack": {"description": "z"}}"#));
+        let l = list_packs(&inst);
+        let nice = &l["packs"][0];
+        assert_eq!(nice["title"], json!("Nice Pack"));
+        assert_eq!(nice["category"], json!("Komfort"));
+        assert_eq!(nice["icon"], json!(true));
+        let plain = &l["packs"][1];
+        assert_eq!((plain["title"].as_str(), plain["icon"].as_bool()), (Some(""), Some(false)));
     }
 }

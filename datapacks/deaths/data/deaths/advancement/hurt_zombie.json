@@ -1,0 +1,25 @@
+{
+  "criteria": {
+    "hurt": {
+      "trigger": "minecraft:entity_hurt_player",
+      "conditions": {
+        "damage": {
+          "type": {
+            "tags": [
+              {
+                "id": "#minecraft:is_projectile",
+                "expected": false
+              }
+            ],
+            "source_entity": {
+              "minecraft:entity_type": "#deaths:zombies"
+            }
+          }
+        }
+      }
+    }
+  },
+  "rewards": {
+    "function": "deaths:cause/zombie"
+  }
+}

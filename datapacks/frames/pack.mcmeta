@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Schleichen + Rechtsklick mit einer Glasscheibe macht Item-Rahmen unsichtbar, nur das Item bleibt zu sehen. Die Scheibe bekommst du zurück.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Unsichtbare Rahmen",
+    "category": "Bauen & Deko"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "type": "minecraft:set_components",
+  "components": {
+    "!minecraft:consumable": {},
+    "!minecraft:use_effects": {}
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Rechtsklick mit der Hacke auf reife Felder erntet sie und pflanzt mit Saatgut aus deinem Inventar neu. Taste gedrückt halten und übers Feld schwenken.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Erntehelfer",
+    "category": "Komfort"
+  }
+}

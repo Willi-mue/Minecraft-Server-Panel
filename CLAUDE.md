@@ -52,29 +52,31 @@ servers. `Instance(id)` only computes paths (`server_dir`, `backup_dir`, `settin
 the first server is `main` and keeps the old paths (`DATA_DIR/server`, `BACKUP_DIR`,
 `DATA_DIR/settings.json`), others live in `DATA_DIR/servers/<id>/` with backups in
 `BACKUP_DIR/<id>/`; names in `DATA_DIR/servers.json`. Jars, Java and the data pack library are
-shared (`versions._download_lock` serialises downloads). Every module function that touches server
-files takes the instance as first parameter (`backup.*`, `access.*`, `properties.*`,
-`world.*`, `datapacks.*` except the library) — pass it explicitly, never fall back to a global;
-only `config.load_settings()`, `backup.level_name()` and the `livemap.*` functions default to `main`
-(None = main). Every server has its own live map (`Instance.map_dir`, `livemap.renderer_for(inst)` /
+shared (`versions::DOWNLOAD_LOCK` serialises downloads). Every module function that touches server
+files takes `&Instance` as first parameter (`backup::*`, `access::*`, `properties::*`, `world::*`,
+`datapacks::*` except the library, `config::load_settings`, `livemap::*`) — pass it explicitly, never
+fall back to a global (`Instance::main()` is the first server). Every server has its own live map
+(`Instance.map_dir`, `livemap::renderer_for(inst)` /
 `tracker_for(inst)`; one mapgen process at a time over all servers). Per-server API
-routes live on the `srv` router under `/api/servers/{sid}/…` (dependency `server()` → manager);
+routes live on the `srv` router under `/api/servers/{sid}/…` (handlers call `server(sid)` → manager);
 global: login, `/api/servers` (list/create/rename/delete), version list, jar deletion. Each
 additional server gets a free `server-port` from `SERVER_PORTS`; the user can change it while
 stopped (`PUT …/port`, `instances::set_port`: 1024–65535, unique, not the panel's ports);
-`_check_port()` refuses to start two running servers on one port. Confirmations use the panel's
+`ServerManager::check_port` refuses to start two running servers on one port. Confirmations use the panel's
 own `ask()` dialog in app.js (optional text field), never the browser's `confirm()`/`prompt()`.
 
 **Threading model (the key thing to understand).** `panel/src/server.rs` holds one `ServerManager` per
-instance in `managers` (`get_manager(id)`). The Java process runs via `subprocess.Popen` with a dedicated reader
-thread parsing stdout line by line. Long actions (start/stop/restart/backup/download) go through
-`_exclusive()`, which takes a non-blocking lock and runs the action in a daemon thread. A second
-concurrent action raises `BusyError`, which `api::ApiError` maps to HTTP 409 (and `Error::Invalid` to 400). Errors inside the thread are reported to the UI via `m.info()` rather
-than raised.
+instance in `MANAGERS` (`server::get(id)`, `server::all()`). Server work is plain blocking code on
+OS threads (`std::process::Command` + `std::thread::spawn`); async handlers wrap blocking calls in
+`spawn_blocking`. The Java process gets a dedicated reader thread parsing stdout line by line. Long
+actions (start/stop/restart/backup/download) go through `ServerManager::exclusive()`, which sets an
+atomic `action` flag and runs the action in its own thread. A second concurrent action returns
+`Error::Busy`, which `api::ApiError` maps to HTTP 409 (and `Error::Invalid` to 400). Errors inside
+the thread are reported to the UI via `m.info()` rather than returned.
 
-**Live feed.** Threads push events to WebSocket clients through `ServerManager._emit()` → the shared
-`hub` (`EventHub`), which tags every event with `"server": id` and uses
-`loop.call_soon_threadsafe` onto per-client `asyncio.Queue`s (slow clients get events dropped).
+**Live feed.** Threads push events to WebSocket clients through `ServerManager::emit()` → the shared
+`HUB` (`EventHub`), which tags every event with `"server": id` and sends it on a
+`tokio::sync::broadcast` channel (capacity 2000; a lagging client skips the events it missed).
 Event types: `log`, `chat`, `status`, `stats` — handled in the `switch (msg.type)` in
 `app/static/app.js` (events of other servers only update their status dot in the sidebar). The
 frontend is a sidebar + pages layout with hash routing `#/<server>/<page>` (`route()`,
@@ -87,12 +89,12 @@ idle cost is a stated feature).
 "Done" (→ RUNNING), joins/leaves, chat, `list` output, whitelist rejections, "Saved the game"
 (used to synchronise live backups: `save-off` → `save-all flush` → wait → zip → `save-on`), and
 EULA prompts. Changes to Minecraft's log format break these. Joins/leaves are also written to
-`players.json` (first/last seen, `players.record`). The panel's own queries go through
-`ServerManager.ask(commands, pattern, expected, timeout)`: matching answer lines are swallowed
-(`_consume_query`, checked first in `_handle_line`) — used for TPS (`query_tick`: Paper `tps` +
-`mspt`, else `tick query` on 1.20.3+) and game rules (`gamerule <name>`). `_tick_loop` asks every 10 s
-only while a WebSocket is connected; `_history_loop` keeps one point per 30 s (CPU/RAM/players/TPS,
-`ServerManager.history`, 1 h) only for running servers.
+`players.json` (first/last seen, `players::record`). The panel's own queries go through
+`ServerManager::ask(commands, pattern, expected, timeout)`: matching answer lines are swallowed
+(`consume_query`, checked first in `handle_line`) — used for TPS (`query_tick`: Paper `tps` +
+`mspt`, else `tick query` on 1.20.3+) and game rules (`gamerule <name>`). `tasks::tick_loop` asks
+every 10 s only while a WebSocket is connected; `tasks::history_loop` keeps one point per 30 s
+(CPU/RAM/players/TPS, `ServerManager::history`, 1 h) only for running servers.
 
 **Online vs. offline mutations.** Whitelist/ops/ban changes (`panel/src/access.rs`, `change` in `api.rs`)
 send server commands when the server is RUNNING, edit `whitelist.json` / `ops.json` /
@@ -170,7 +172,7 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   `SkullOwner`, base64 `textures` → texture hash, `chunk::skin_hash`), keeps those the normal stacks
   show (a head in a hidden cave stays hidden) and writes `k/<x>_<z>.json` per region, merged into
   `<dim>/heads.json` (`{x, y, z, skin, rot, wall}`). The panel downloads the skins once from
-  `textures.minecraft.net/texture/<hash>` (`livemap.fetch_head_skins` after each render, PNG ≤ 64 KB,
+  `textures.minecraft.net/texture/<hash>` (`skins::fetch_head_skins` after each render, PNG ≤ 64 KB,
   `DATA_DIR/cache/heads/`), served at `heads/<hash>.png`; the 3D viewer puts a box with the skin
   (`player3d.headModel`) over the block model's Steve head within 160 blocks of the camera.
   Banner patterns and pot sherds the same way: `chunk::Decor` from the block entities (`patterns`
@@ -184,7 +186,7 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   `cargo test` covers parsing, colors, shading, tiles, model/biome resolution.
 - `panel/src/livemap.rs` runs mapgen as a low-priority subprocess (`Renderer`, one at a time) and tracks
   player positions (`PlayerTracker`): `data get entity <name> Pos/Dimension` is sent only while the
-  map was requested in the last 30 s, and the answers are swallowed in `ServerManager._handle_line`
+  map was requested in the last 30 s, and the answers are swallowed in `ServerManager::handle_line`
   (only for names we just queried). `tasks::map_render_loop` renders at startup and every
   `MAP_INTERVAL` s while running; the server exit and "Render now" (`save-all flush` first) trigger too.
   `client_jar()` downloads the Minecraft client of the world's version once from Mojang
@@ -236,12 +238,12 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   A click on the map picks a spot (y from the height tiles, worker message `height`); clicking the
   coordinate box copies `/execute in <dim> run tp @s x y z` (execCommand fallback on plain http).
 - `panel/src/mapserver.rs` serves viewer (Leaflet and three.js vendored), tiles, `maps.json`,
-  `blocks.json`/`atlas.png`, `players.json` and `skins/<uuid>.png` on `MAP_PORT` (separate uvicorn server in its own thread):
+  `blocks.json`/`atlas.png`, `players.json` and `skins/<uuid>.png` on `MAP_PORT` (`mapserver::router()`, a second axum listener started in `main.rs`; the panel keeps running if it cannot bind):
   every server at `/s/<id>/` (viewer served there too, so relative URLs need no prefix; status field
   `map_path`); `/` serves main, but its viewer moves on to the server this browser showed last
   (localStorage `map-last-server`, not when the URL has a position hash), `servers.json` = maps that are on and rendered (the viewer's
   server switch). The map port must never
-  expose anything else. All responses carry COOP/COEP (`_Isolation`) for the viewer's shared
+  expose anything else. All responses carry COOP/COEP (`isolate()` in `mapserver.rs`) for the viewer's shared
   worker memory: everything the viewer loads must stay same-origin (or send CORP).
 - Hall of fame (`panel/src/leaderboard.rs`, `stats.json` on the map port, modal `static/map/leaderboard.js`):
   tier list by share of advancements done (recipes excluded; S ≥ 60 %, A ≥ 40 %, B ≥ 25 %, C ≥ 10 %),
@@ -264,7 +266,7 @@ hard-links the Mojang jar Paper downloads into `server/cache/` as a Vanilla inst
   (`X-Map-Key`, stored as SHA-256), or the owner / an op recognised by login address; the panel
   (`/api/servers/{sid}/waypoints`) may change all. The map stays LAN-only by decision (no reverse
   proxy, no `X-Forwarded-For`): the address recognition relies on seeing the players' real addresses.
-- Player heads: `livemap.skins` maps names to uuids via the server's `usercache.json` and downloads
+- Player heads: `skins.rs` maps names to uuids via the server's `usercache.json` and downloads
   skins from Mojang (session server → only `textures.minecraft.net`, PNG ≤ 64 KB, daily refresh,
   1 h back-off) into `DATA_DIR/cache/skins/`; `players.json` names the `skin` once it exists; the
   viewer cuts out face + hat (hat ignored on old 64×32 skins when fully opaque).
@@ -276,22 +278,25 @@ place before each start when missing; upload via `PUT /icon`, the page scales th
 installed into `<world>/datapacks/`; enabled state lives per world in level.dat
 `Data.DataPacks.Enabled/Disabled` — online via `minecraft:datapack` + `save-all` until level.dat shows
 it, offline by editing level.dat with `nbt.rs`, a byte-exact NBT round-trip codec (Java modified UTF-8); "New world"
-installs the selected packs before generation), `properties.rs` (whitelisted, validated subset of `server.properties` for the
+installs the selected packs before generation; optional pack.mcmeta section `panel: {title, category}` +
+`pack.png` give the list its name, grouping and icon; the server's own packs live in the repo's `datapacks/`,
+see its README), `properties.rs` (whitelisted, validated subset of `server.properties` for the
 game settings dialog), `world.rs` (minimal NBT reader: `level.dat` → `Data.Version.Name`, used when
 `settings.json` has no `world_version`), `backup.rs` (`restore()` validates zip member paths, makes a
 `_before-restore` safety backup and protects the restored file from retention cleanup).
-`archive_*.zip` files (written by "New world", `ServerManager._new_world`) must never be deleted:
+`archive_*.zip` files (written by "New world", `ServerManager::new_world`) must never be deleted:
 `cleanup()` only globs `backup_*.zip` — keep it that way. `backup.add_upload()` turns an uploaded world
 zip (server world, or single-player save with level.dat in the root / one folder) into
 `backup_<stamp>_upload.zip` with this server's folder names, checked like a restore.
 `addons.rs`: mods (Fabric, `server/mods/`) and plugins (Paper, `server/plugins/`), kind from the
 server's flavor; metadata from `fabric.mod.json` (incl. jar-in-jar ids for dependency checks, version
-ranges via `addons.matches`) or `plugin.yml`/`paper-plugin.yml` (tiny YAML subset parser, no PyYAML);
-disabling = rename to `.jar.disabled`; Modrinth search/install (required deps)/updates (by SHA-512 via
+ranges via `addons::matches`) or `plugin.yml`/`paper-plugin.yml` (tiny YAML subset parser, no YAML crate);
+disabling = rename to `.jar.disabled`; for mods only (never plugins: `modrinth_allowed`, by decision; plugins
+are upload-only and the UI hides the Modrinth card) Modrinth search/install (required deps)/updates (by SHA-512 via
 `/version_files/update`), downloads only from Modrinth's CDN with SHA-512 check.
 `players.rs`: profiles from `usercache.json`, `world/players/{stats,data}` (26.x) or
 `world/{stats,playerdata}` (older), world spawn from level.dat (`Data.spawn` or `SpawnX/Y/Z`), skins via
-`livemap.fetch_skin` (shared cache); the browser cuts out the head (`headUrl()` in app.js).
+`skins::fetch_skin` (shared cache); the browser cuts out the head (`headUrl()` in app.js).
 `gamerules.rs`: 26.x keeps rules in `<world>/dimensions/minecraft/overworld/data/minecraft/game_rules.dat`
 (typed, `minecraft:snake_case`), older worlds in level.dat `Data.GameRules` (strings); never hard-code the
 list — `KNOWN` only adds labels. `sessions.rs`: see below.
@@ -299,7 +304,7 @@ list — `KNOWN` only adds labels. `sessions.rs`: see below.
 **Security-relevant invariants:**
 - User-supplied flavor/version ids are validated (`validate_flavor`, `config.validate_version`)
   before being used in file paths — keep that for any new path built from request data. Same for
-  server ids (`instances.validate_id`, applied in the `server()` dependency).
+  server ids (`instances.validate_id`, applied in `api::server()`).
 - Console commands are rejected if they contain newlines (stdin injection).
 - Sessions survive restarts: `DATA_DIR/sessions.json` holds only SHA-256 hashes of the tokens plus
   a fingerprint of the password (a new `PANEL_PASSWORD` logs everybody out); 30 days, sliding

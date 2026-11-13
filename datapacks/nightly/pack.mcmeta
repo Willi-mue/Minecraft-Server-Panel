@@ -1,0 +1,11 @@
+{
+  "pack": {
+    "description": "Bei Sonnenaufgang die Bilanz der Nacht im Chat: wer die meisten Mobs besiegt hat, wer am häufigsten gestorben ist und wer am weitesten gelaufen ist.",
+    "min_format": 121,
+    "max_format": 121
+  },
+  "panel": {
+    "title": "Nachtbilanz",
+    "category": "Spaß"
+  }
+}

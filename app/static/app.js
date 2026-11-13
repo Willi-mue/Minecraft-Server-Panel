@@ -1043,28 +1043,56 @@ function renderDatapacks(d) {
     return;
   }
   const alive = ui.status && ui.status.state !== "stopped";
+  // Grouped by the optional pack.mcmeta "panel.category" (packs without one come last)
+  const other = "Other";
+  const groups = new Map();
   for (const p of d.packs) {
-    const label = p.name.replace(/\.zip$/i, "");
-    const toggle = p.installed
-      ? switchInput(p.status !== "disabled", p.status !== "disabled" ? `Disable ${label} in this world` : `Enable ${label} in this world`,
+    const c = p.category || other;
+    if (!groups.has(c)) groups.set(c, []);
+    groups.get(c).push(p);
+  }
+  const order = [...groups.keys()].sort((a, b) => (a === other) - (b === other) || a.localeCompare(b));
+  const showHeads = order.length > 1 || order[0] !== other;
+  for (const c of order) {
+    if (showHeads) ul.append(el("li", { className: "group-head", textContent: c }));
+    for (const p of groups.get(c)) renderDatapack(ul, p, alive);
+  }
+}
+
+function renderDatapack(ul, p, alive) {
+  {
+    const label = p.title || p.name.replace(/\.zip$/i, "");
+    // Every pack gets a switch: switching on a library pack that is not in the world installs it first
+    const on = p.installed && p.status !== "disabled";
+    const toggle = p.installed || p.in_library
+      ? switchInput(on, on ? `Disable ${label} in this world` : `Enable ${label} in this world`,
           (input) => toggleDatapack(p, input), !p.valid)
       : null;
-    const meta = [PACK_STATUS[p.status], p.in_library ? null : "only in this world", `${p.size_kb} KB`].filter(Boolean).join(" · ");
-    const iconBox = el("span", { className: "pack-icon", textContent: label[0]?.toUpperCase() || "?" });
-    iconBox.style.background = nameColor(label);
+    // On/off is what the switch shows; only say what it cannot (waiting for the next start)
+    const meta = [p.status === "new" ? PACK_STATUS.new : null, p.in_library ? null : "only in this world", `${p.size_kb} KB`].filter(Boolean).join(" · ");
+    let iconBox;
+    if (p.icon) {
+      // pack.png; the size in the URL refreshes it after an update
+      iconBox = el("img", { className: "pack-icon pixel", alt: "", loading: "lazy",
+        src: S(`/datapacks/${encodeURIComponent(p.name)}/icon?v=${p.size_kb}`) });
+    } else {
+      iconBox = el("span", { className: "pack-icon", textContent: label[0]?.toUpperCase() || "?" });
+      iconBox.style.background = nameColor(label);
+    }
     iconBox.setAttribute("aria-hidden", "true");
-    ul.append(el("li", { className: p.installed ? "" : "inactive" },
+    ul.append(el("li", { className: p.installed ? "" : "inactive", dataset: { pack: p.name } },
       iconBox,
       el("div", { className: "grow" },
-        el("div", { className: "title", textContent: label }),
+        el("div", { className: "title", textContent: label },
+          p.title ? el("span", { className: "pack-id", textContent: p.name }) : null),
         p.description ? el("div", { className: "meta", textContent: p.description }) : null,
         el("div", { className: "meta", textContent: meta })),
       p.valid ? null : tag("no pack.mcmeta", "warn", "warning"),
       p.outdated ? tag("update", "info") : null,
       el("span", { className: "row-actions" },
-        p.in_library && (!p.installed || p.outdated)
-          ? packButton("download-simple", p.outdated ? `Update ${label} in this world from the library` : `Install ${label} in this world`,
-              () => packAction(p, "install", "POST", p.outdated ? "updated" : "installed"))
+        p.in_library && p.outdated
+          ? packButton("download-simple", `Update ${label} in this world from the library`,
+              () => packAction(p, "install", "POST", "updated"))
           : null,
         p.in_library ? null
           : packButton("archive", `Copy ${label} to the library`, () => packAction(p, "adopt", "POST", "copied to the library")),
@@ -1087,25 +1115,52 @@ async function loadDatapacks() {
   }
 }
 
+const PACK_BUSY = { install: "Updating…", adopt: "Copying to the library…", world: "Removing…", library: "Deleting…" };
+
+// While an action runs (it can take seconds: /reload and saving until level.dat shows the result),
+// the pack's row shows what is happening and its controls are locked; the next render ends it.
+function packBusy(p, text) {
+  const li = $("#datapacks").querySelector(`li[data-pack="${CSS.escape(p.name)}"]`);
+  if (!li) return;
+  li.classList.add("busy");
+  li.querySelectorAll("button, input").forEach((c) => { c.disabled = true; });
+  li.querySelector(".row-actions")?.prepend(
+    el("span", { className: "busy-note", role: "status" }, el("span", { className: "spinner" }), text));
+}
+
 async function packAction(p, action, method, done) {
+  packBusy(p, PACK_BUSY[action] || "Working…");
   try {
     renderDatapacks(await api(S(`/datapacks/${encodeURIComponent(p.name)}/${action}`), { method }));
-    toast(`${p.name} ${done}`);
+    toast(`${p.title || p.name} ${done}`);
   } catch (err) {
     toast(err.message, true);
+    if (ui.datapacks) renderDatapacks(ui.datapacks);
   }
 }
 
 async function toggleDatapack(p, input) {
   const enabled = input.checked;
   input.disabled = true;
+  packBusy(p, enabled ? (p.installed ? "Enabling…" : "Installing…") : "Disabling…");
+  const url = (action) => S(`/datapacks/${encodeURIComponent(p.name)}/${action}`);
   try {
-    renderDatapacks(await api(S(`/datapacks/${encodeURIComponent(p.name)}/enabled`), { method: "POST", body: { enabled } }));
-    toast(`${p.name} ${enabled ? "enabled" : "disabled"}`);
+    if (enabled && !p.installed) {
+      // Copy it into the world (enabled on /reload or the next start); a pack that was disabled in
+      // this world before stays disabled after installing, so enable it explicitly then
+      const d = await api(url("install"), { method: "POST" });
+      const now = d.packs.find((x) => x.name === p.name);
+      renderDatapacks(now?.status === "disabled"
+        ? await api(url("enabled"), { method: "POST", body: { enabled } })
+        : d);
+      toast(`${p.title || p.name} enabled`);
+      return;
+    }
+    renderDatapacks(await api(url("enabled"), { method: "POST", body: { enabled } }));
+    toast(`${p.title || p.name} ${enabled ? "enabled" : "disabled"}`);
   } catch (err) {
-    input.checked = !enabled;
-    input.disabled = false;
     toast(err.message, true);
+    if (ui.datapacks) renderDatapacks(ui.datapacks);
   }
 }
 
@@ -1192,13 +1247,18 @@ function renderAddons(d) {
   const [Title, one] = KIND_LABEL[d.kind];
   $("#jars-title").textContent = `${Title} on this server`;
   $("#jars-note").textContent = d.running ? "changes apply after a restart" : "";
-  $("#jar-drop-note").textContent = `${one} .jar from another source`;
+  // Modrinth only for Fabric mods: for plugins the panel never contacts it (upload only)
+  const modrinth = d.kind === "mods";
+  $("#mr-box").classList.toggle("hidden", !modrinth);
+  $("#upload-head").classList.toggle("hidden", modrinth);
+  $("#jars-updates").classList.toggle("hidden", !modrinth);
+  $("#jar-drop-note").textContent = modrinth ? `${one} .jar from another source` : `${one} .jar`;
   $("#mr-note").textContent = d.version ? `${d.kind === "mods" ? "Fabric" : "Paper"} ${d.version}, only server-compatible projects`
     : "Choose a Minecraft version first";
   const ul = $("#jars");
   ul.replaceChildren();
   if (!d.items.length) {
-    ul.append(el("li", { className: "empty", textContent: `No ${Title.toLowerCase()} yet — search Modrinth or upload a .jar` }));
+    ul.append(el("li", { className: "empty", textContent: `No ${Title.toLowerCase()} yet — ${modrinth ? "search Modrinth or " : ""}upload a .jar` }));
     return;
   }
   const updates = ui.addonUpdates || {};
@@ -1237,7 +1297,7 @@ async function loadAddons() {
     if (sid !== ui.sid) return;
     renderAddons(d);
     // First visit: show popular projects for this version
-    if (d.kind && d.version && !$("#mr-results").childElementCount) searchModrinth();
+    if (d.kind === "mods" && d.version && !$("#mr-results").childElementCount) searchModrinth();
   } catch (err) {
     toast(err.message, true);
   }
@@ -2116,7 +2176,7 @@ $("#new-world-btn").addEventListener("click", async () => {
   $("#world-packs").replaceChildren(...packs.map((p) => el("label", { className: "check" },
     el("input", { type: "checkbox", value: p.name, checked: p.installed && p.status !== "disabled" }),
     el("span", { className: "box" }, icon("check")),
-    el("span", { textContent: p.name.replace(/\.zip$/i, "") + (p.in_library ? "" : " (copied to the library)") }))));
+    el("span", { textContent: (p.title || p.name.replace(/\.zip$/i, "")) + (p.in_library ? "" : " (copied to the library)") }))));
   worldDialog.showModal();
 });
 worldDialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => worldDialog.close()));

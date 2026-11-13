@@ -304,14 +304,17 @@
               <ul id="jars" class="list roomy"></ul>
             </section>
             <section class="card side-card">
-              <div class="card-head"><h2>Find on Modrinth</h2></div>
-              <form id="mr-form" class="inline-form">
-                <label for="mr-query" class="sr-only">Search Modrinth</label>
-                <input id="mr-query" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
-                <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-magnifying-glass"/></svg></button>
-              </form>
-              <p id="mr-note" class="muted small-text"></p>
-              <ul id="mr-results" class="list mr-list"></ul>
+              <div id="mr-box">
+                <div class="card-head"><h2>Find on Modrinth</h2></div>
+                <form id="mr-form" class="inline-form">
+                  <label for="mr-query" class="sr-only">Search Modrinth</label>
+                  <input id="mr-query" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+                  <button class="btn" type="submit"><svg class="i"><use href="/static/icons.svg#ph-magnifying-glass"/></svg></button>
+                </form>
+                <p id="mr-note" class="muted small-text"></p>
+                <ul id="mr-results" class="list mr-list"></ul>
+              </div>
+              <div id="upload-head" class="card-head hidden"><h2>Add a plugin</h2></div>
               <label class="dropzone" for="jar-file">
                 <svg class="i big"><use href="/static/icons.svg#ph-download-simple"/></svg>
                 <strong>Upload .jar</strong>
